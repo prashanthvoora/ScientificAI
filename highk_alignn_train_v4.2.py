@@ -2862,7 +2862,8 @@ class MaskedMultiTaskLoss(nn.Module):
 
             # Functional-weighted loss: apply after NaN mask so indexing aligns
             if functional_weights is not None:
-                fw_m = functional_weights[mask].squeeze()
+                mask_1d = mask.view(-1) if mask.ndim > 1 else mask
+                fw_m = functional_weights[mask_1d].squeeze()
                 per_sample_loss = per_sample_loss * fw_m
 
             task_loss   = per_sample_loss.mean()
@@ -2918,6 +2919,8 @@ class ALIGNNTrainer:
                 output_device          = _DIST["rank"],
                 find_unused_parameters = True,    # proc/stack encoders unused in Tier 1/2
                 gradient_as_bucket_view= True,    # ~33% peak VRAM reduction, no correctness cost
+                find_unused_parameters = True,    # proc/stack encoders unused in Tier 1/2
+                gradient_as_bucket_view = True,    # ~33% peak VRAM reduction, no correctness cost
             )
             self.model_core = self.model.module   # raw HighKALIGNN
         else:
@@ -3172,8 +3175,8 @@ class ALIGNNTrainer:
             else:
                 task_to_batch_key[col] = col
 
-        task_preds   = {h: [] for h in self.model.task_heads}
-        task_targets = {h: [] for h in self.model.task_heads}
+        task_preds   = {h: [] for h in self.model_core.task_heads}
+        task_targets = {h: [] for h in self.model_core.task_heads}
         n_batches    = 0
 
         for batch in loader:
@@ -3191,7 +3194,7 @@ class ALIGNNTrainer:
             if self.ablate_context:
                 proc_ctx = stack_ctx = None
 
-            all_preds  = self.model.forward_all_tasks(
+            all_preds  = self.model_core.forward_all_tasks(
                 graph, line_graph,
                 proc_context=proc_ctx,
                 stack_context=stack_ctx,
@@ -3235,7 +3238,7 @@ class ALIGNNTrainer:
         total_rows = len(torch.cat(task_targets[primary_col]).squeeze())
         results    = {}
 
-        for head_name in self.model.task_heads:
+        for head_name in self.model_core.task_heads:
             if not task_preds[head_name]:
                 results[head_name] = {
                     "mae": float("nan"), "rmse": float("nan"),
@@ -3599,7 +3602,7 @@ def run_tier1_pretrain(df_tier1: pd.DataFrame, ablate_context: bool = False):
     best_ckpt = CKPT_ROOT / "tier1_best.pt"
     if best_ckpt.exists():
         ckpt = torch.load(best_ckpt, map_location="cpu")
-        trainer.model.load_state_dict(ckpt["model_state_dict"])
+        trainer.model_core.load_state_dict(ckpt["model_state_dict"])
 
     test_mae, test_rmse = trainer.evaluate(test_loader, cfg["target"])
     log.info("Tier 1 TEST  MAE=%.4f  RMSE=%.4f  (target: %s)",
@@ -3732,7 +3735,7 @@ def run_tier2_finetune(
     best_ckpt = CKPT_ROOT / "tier2_best.pt"
     if best_ckpt.exists():
         ckpt = torch.load(best_ckpt, map_location="cpu")
-        trainer.model.load_state_dict(ckpt["model_state_dict"])
+        trainer.model_core.load_state_dict(ckpt["model_state_dict"])
 
     test_mae_log, test_rmse_log, preds_log, trues_log = trainer.evaluate(
         test_loader, target_col, return_preds=True
@@ -3921,7 +3924,7 @@ def run_tier3_finetune(
     best_ckpt = CKPT_ROOT / "tier3_best.pt"
     if best_ckpt.exists():
         ckpt = torch.load(best_ckpt, map_location="cpu")
-        trainer.model.load_state_dict(ckpt["model_state_dict"])
+        trainer.model_core.load_state_dict(ckpt["model_state_dict"])
 
     test_mae, test_rmse = trainer.evaluate(test_loader, cfg["target"])
     log.info("Tier 3 TEST  MAE=%.4f  RMSE=%.4f  (target: k_measured)",
