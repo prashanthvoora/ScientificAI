@@ -2963,8 +2963,6 @@ class ALIGNNTrainer:
                 output_device          = _DIST["rank"],
                 find_unused_parameters = True,    # proc/stack encoders unused in Tier 1/2
                 gradient_as_bucket_view= True,    # ~33% peak VRAM reduction, no correctness cost
-                find_unused_parameters = True,    # proc/stack encoders unused in Tier 1/2
-                gradient_as_bucket_view = True,    # ~33% peak VRAM reduction, no correctness cost
             )
             self.model_core = self.model.module   # raw HighKALIGNN
         else:
