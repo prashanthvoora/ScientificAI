@@ -1,0 +1,190 @@
+diff --git a/highk_alignn_train_v4.4.py b/highk_alignn_train_v4.4.py
+index 21e68e6..0d73f3e 100755
+--- a/highk_alignn_train_v4.4.py
++++ b/highk_alignn_train_v4.4.py
+@@ -279,6 +279,7 @@ import sys
+ import json
+ import math
+ import time
++import random
+ import hashlib
+ import logging
+ import argparse
+@@ -352,6 +353,32 @@ def init_dist() -> bool:
+     return True
+ 
+ 
++def set_deterministic_seed(seed: int = 42) -> None:
++    """Set Python / NumPy / PyTorch seeds for reproducible runs."""
++    random.seed(seed)
++    np.random.seed(seed)
++    torch.manual_seed(seed)
++    if torch.cuda.is_available():
++        torch.cuda.manual_seed_all(seed)
++    torch.backends.cudnn.deterministic = True
++    torch.backends.cudnn.benchmark = False
++    os.environ.setdefault("PYTHONHASHSEED", str(seed))
++
++
++def validate_target_columns(df: pd.DataFrame, target_cols: List[str], label: str) -> None:
++    """Fail fast on missing or non-finite target columns in production runs."""
++    missing = [c for c in target_cols if c not in df.columns]
++    if missing:
++        raise ValueError(f"{label}: missing required columns -> {missing}")
++
++    for col in target_cols:
++        s = pd.to_numeric(df[col], errors="coerce")
++        if s.dropna().empty:
++            raise ValueError(f"{label}: column '{col}' has no valid numeric values")
++        if not np.isfinite(s.dropna().to_numpy()).all():
++            raise ValueError(f"{label}: column '{col}' contains non-finite values")
++
++
+ def is_rank0() -> bool:
+     """True for the primary process (rank 0), or in single-GPU mode."""
+     return _DIST["rank"] == 0
+@@ -3859,25 +3886,24 @@ def run_tier2_finetune(
+         mae_k_exact  = (torch.exp(p_valid) - torch.exp(t_valid)).abs().mean().item()
+         rmse_k_exact = ((torch.exp(p_valid) - torch.exp(t_valid))**2).mean().sqrt().item()
+ 
+-        # Review fix #4: clear log vs linear labelling so results are not
+-        # mis-read as "MAE=0.205 dielectric units" (it is log-space MAE).
++        # Review fix #4: keep the diagnostic log-space numbers separate from the
++        # benchmark metric used for publication/comparison on the linear-k scale.
+         log.info("")
+         log.info("─" * 68)
+         log.info("  TIER 2 TEST RESULTS  (k_total_log target)")
+         log.info("─" * 68)
+-        log.info("  Log-space  MAE  = %.4f  [log(k) units — NOT dielectric units]",
+-                 test_mae_log)
+-        log.info("  Log-space  RMSE = %.4f", test_rmse_log)
+-        log.info("  exp(MAE)        = %.4f×  → predictions within ±%.1f%% on average",
++        log.info("  Diagnostic log-space  MAE  = %.4f  [log(k) units]", test_mae_log)
++        log.info("  Diagnostic log-space  RMSE = %.4f", test_rmse_log)
++        log.info("  exp(MAE)                  = %.4f×  → ±%.1f%% average relative error",
+                  math.exp(test_mae_log), (math.exp(test_mae_log) - 1) * 100)
+         log.info("")
+-        log.info("  Linear-k   MAE  = %.4f  [dielectric units, exact: mean|exp(p)−exp(t)|]",
++        log.info("  PRIMARY benchmark (linear-k) MAE  = %.4f  [dielectric units, exact]",
+                  mae_k_exact)
+-        log.info("  Linear-k   RMSE = %.4f  [dielectric units]", rmse_k_exact)
+-        log.info("")
++        log.info("  PRIMARY benchmark (linear-k) RMSE = %.4f  [dielectric units]", rmse_k_exact)
++        log.info("  Benchmark scale for publication: LINEAR-K")
+         log.info("  ALIGNN paper    MAE  ≈ 0.81  [linear k, JARVIS DFPT, k range 5–100]")
+         log.info("  Our distribution     k = 3.9–386 (100× wider → higher linear MAE expected)")
+-        log.info("  MAD:MAE (log-space)  — see multitask table below for full breakdown")
++        log.info("  MAD:MAE (benchmark scale)  — see multitask table below for full breakdown")
+         log.info("─" * 68)
+     else:
+         log.info("Tier 2 TEST  MAE=%.4f  RMSE=%.4f  (target: k_total)",
+@@ -3888,13 +3914,19 @@ def run_tier2_finetune(
+ 
+     out_path = REPORT_ROOT / "tier2_test_results.json"
+     primary_metrics = {
+-        "mae_log":          test_mae_log,
+-        "rmse_log":         test_rmse_log,
+-        "exp_mae_multiplier": math.exp(test_mae_log),
++        "mae":                    test_mae_log,
++        "rmse":                   test_rmse_log,
++        "mae_log_k":              test_mae_log,
++        "rmse_log_k":             test_rmse_log,
++        "exp_mae_multiplier":     math.exp(test_mae_log),
++        "benchmark_scale":        "linear",
++        "diagnostic_scale":       "log",
+     }
+     if cfg.get("log_transform", False):
+-        primary_metrics["mae_k_exact"]  = mae_k_exact
+-        primary_metrics["rmse_k_exact"] = rmse_k_exact
++        primary_metrics["mae_linear_k"]  = mae_k_exact
++        primary_metrics["rmse_linear_k"] = rmse_k_exact
++        primary_metrics["mae"]           = mae_k_exact
++        primary_metrics["rmse"]          = rmse_k_exact
+     with open(out_path, "w") as f:
+         json.dump({"primary": primary_metrics, "multitask": mt_results}, f, indent=2)
+     log.info("Tier 2 test results saved → %s", out_path)
+@@ -4325,8 +4357,21 @@ def run_tier_evaluate(
+         return
+ 
+     ckpt = torch.load(checkpoint_path, map_location="cpu")
++    if "model_state_dict" not in ckpt:
++        raise ValueError(f"Checkpoint is missing model_state_dict: {checkpoint_path}")
++
+     saved_epoch = ckpt.get("epoch", "?")
+     saved_mae   = ckpt.get("val_mae", float("nan"))
++
++    ckpt_keys = set(ckpt["model_state_dict"].keys())
++    current_keys = set(model.state_dict().keys())
++    missing_keys = sorted(current_keys - ckpt_keys)
++    unexpected_keys = sorted(ckpt_keys - current_keys)
++    if missing_keys:
++        log.warning("Checkpoint missing %d model keys; loading with strict=False", len(missing_keys))
++    if unexpected_keys:
++        log.warning("Checkpoint contains %d unexpected keys", len(unexpected_keys))
++
+     model.load_state_dict(ckpt["model_state_dict"], strict=False)
+     log.info("Loaded checkpoint: epoch=%s  saved_val_MAE=%.4f", saved_epoch, saved_mae)
+ 
+@@ -4350,12 +4395,13 @@ def run_tier_evaluate(
+                         torch.exp(trues_t[valid])).abs().mean().item()
+         rmse_k_exact = ((torch.exp(preds_t[valid]) -
+                          torch.exp(trues_t[valid])) ** 2).mean().sqrt().item()
+-        log.info("  Log-space  MAE  = %.4f  [log(k) units]", test_mae_log)
+-        log.info("  Log-space  RMSE = %.4f", test_rmse_log)
+-        log.info("  exp(MAE)        = %.4f×  → ±%.1f%% average relative error",
++        log.info("  Diagnostic log-space  MAE  = %.4f  [log(k) units]", test_mae_log)
++        log.info("  Diagnostic log-space  RMSE = %.4f", test_rmse_log)
++        log.info("  exp(MAE)                  = %.4f×  → ±%.1f%% average relative error",
+                  math.exp(test_mae_log), (math.exp(test_mae_log) - 1) * 100)
+-        log.info("  Linear-k   MAE  = %.4f  [dielectric units, exact]", mae_k_exact)
+-        log.info("  Linear-k   RMSE = %.4f  [dielectric units]", rmse_k_exact)
++        log.info("  PRIMARY benchmark (linear-k) MAE  = %.4f  [dielectric units, exact]", mae_k_exact)
++        log.info("  PRIMARY benchmark (linear-k) RMSE = %.4f  [dielectric units]", rmse_k_exact)
++        log.info("  Benchmark scale for publication: LINEAR-K")
+         log.info("  ALIGNN paper    ≈ 0.81  [linear k, JARVIS DFPT]")
+     else:
+         log.info("  MAE  = %.4f", test_mae_log)
+@@ -4370,10 +4416,17 @@ def run_tier_evaluate(
+     # ── Save to JSON ──────────────────────────────────────────────────────────
+     out_path = REPORT_ROOT / f"tier{tier}_evaluate_results.json"
+     primary  = {"mae": test_mae_log, "rmse": test_rmse_log,
++                "mae_log_k": test_mae_log,
++                "rmse_log_k": test_rmse_log,
+                 "checkpoint_epoch": saved_epoch,
+-                "checkpoint_val_mae": saved_mae}
++                "checkpoint_val_mae": saved_mae,
++                "benchmark_scale": "linear",
++                "diagnostic_scale": "log"}
+     if tier == 2 and cfg.get("log_transform", False):
+-        primary.update({"mae_k_exact": mae_k_exact, "rmse_k_exact": rmse_k_exact,
++        primary.update({"mae_linear_k": mae_k_exact,
++                        "rmse_linear_k": rmse_k_exact,
++                        "mae": mae_k_exact,
++                        "rmse": rmse_k_exact,
+                         "exp_mae_multiplier": math.exp(test_mae_log)})
+     with open(out_path, "w") as f:
+         json.dump({"primary": primary, "multitask": mt_results}, f, indent=2)
+@@ -4409,8 +4462,12 @@ def main():
+             "measure context branches' effect on Tier 3 k_measured MAE."
+         ),
+     )
++    parser.add_argument("--seed", type=int, default=42,
++                        help="Random seed for reproducible training and evaluation")
+     args = parser.parse_args()
+ 
++    set_deterministic_seed(args.seed)
++
+     # Distributed init — must be first, before any CUDA calls
+     init_dist()
+ 
+@@ -4477,6 +4534,10 @@ def main():
+         df_eval = pd.read_hdf(tier_hdf5, key="data")
+         log.info("  %d rows loaded", len(df_eval))
+ 
++        cfg = TIER1_TRAIN_CONFIG if tier_num == 1 else TIER2_TRAIN_CONFIG
++        validate_target_columns(df_eval, [cfg["target"]] + cfg.get("aux_targets", []),
++                                 f"Tier {tier_num} evaluation input")
++
+         run_tier_evaluate(
+             tier            = tier_num,
+             df              = df_eval,
