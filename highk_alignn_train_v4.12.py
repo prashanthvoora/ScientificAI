@@ -2,8 +2,57 @@
 """
 ==============================================================================
  High-k Dielectric Discovery -- Three-Tier Scalable ALIGNN Training Pipeline
- Version 4.5.8  (CSV numeric value cleaning — ~prefix, ranges, unit suffixes)
+ Version 4.5.9  (7 fixes: 5 CSV column-mapping bugs + Phase A + linear-k)
 ==============================================================================
+ v4.5.9 fixes  (7 bugs — 5 CSV column-mapping + Phase A + exact linear-k)
+ ---------------------------------------------------------------------------
+ BUG-1  J_g_A_cm2_at_1v CASE TYPO: target_renames had "J_g_A_cm2_at_1v"
+        (lowercase v). CSV column is "J_g_A_cm2_at_1V" (uppercase V).
+        Rename never fires → J_g_A_cm2 = 0/120 rows.
+        Fix: added "J_g_A_cm2_at_1V" alias alongside lowercase fallback.
+
+ BUG-2  ald_substrate_temp_c CASE TYPO: proc_renames had "ald_substrate_temp_c"
+        (lowercase c). CSV column is "ald_substrate_temp_C" (uppercase C).
+        substrate_temp_C — the primary ALD process variable — was 0/120 rows,
+        making the ProcessParamsEncoder blind to deposition temperature.
+        Fix: corrected to "ald_substrate_temp_C"; lowercase alias retained.
+
+ BUG-3  chamber_base_pressure WRONG SUFFIX: proc_renames had
+        "chamber_base_pressure_mTorr". CSV column is "chamber_base_pressure_Torr".
+        pressure_mTorr = 0/120 rows. Also: no Torr→mTorr ×1000 unit conversion.
+        Fix: added "chamber_base_pressure_Torr" key + ×1000 conversion block.
+
+ BUG-4  anneal_duration STRING VALUES NOT PARSED: CSV stores "30s", "60 s",
+        "20 min" etc. proc_renames fires correctly but pd.to_numeric() returns
+        NaN on unit-suffixed strings. anneal_duration_min = NaN for all 68 rows.
+        Fix: _parse_duration_to_min() unit-aware parser applied after proc_renames,
+        converting s/min/h strings to float minutes.
+
+ BUG-5  PROCESS PARAM VOCAB MISMATCH: PROCESS_PARAMS_FEATURES categorical vocab
+        lists were defined for the 33-row seed CSV. The updated 120-row CSV has
+        many precursor/oxidant/ambient values not in vocab → all fall to the OOV
+        "other" slot → encoder treats all non-vocab precursors identically.
+        Most impactful: TDMAH/TEMAH (dominant Hf precursors) and "O2 plasma"
+        (space vs underscore variant) both OOV.
+        Fix: expanded vocab lists to cover actual CSV values. Old entries kept at
+        same index positions for checkpoint compatibility with strict=False load.
+
+ FIX-T3-PHASE-A  CATASTROPHIC band_gap FORGETTING: Tier 3 fine-tunes the full
+        backbone on ~50-80 k_measured_log rows with 2× task weight. The backbone
+        forgets band_gap representations, driving MAD:MAE from 7.3 → 0.72.
+        The degraded crystal embeddings also hurt k_measured prediction.
+        Fix: 20-epoch Phase A on full df_tier2 (~5K oxide rows) with band_gap
+        as primary target before Phase B k_measured_log fine-tuning. Mirrors
+        Tier 2 proven phase_a_epochs=30 strategy. Requires df_tier2 passed to
+        run_tier3_finetune(); falls back gracefully with WARNING if None.
+
+ FIX-T3-LINMAE  APPROXIMATE LINEAR-k MAE REPORTED: Tier 3 test block used
+        (exp(log_MAE)-1)*100 — correct only when all k values equal k_mean.
+        MAD:MAE=0.14 came from log-space MAD≈0 (5 near-identical test samples),
+        not a true model quality signal.
+        Fix: return_preds=True → exact mean|exp(pred)-exp(true)| with linear-k
+        MAD:MAE and pass/fail status vs paper (1.63) and project (2.5) goals.
+
  v4.5.8 fix  (valid k_measured_log still only 28 after --rebuild_tier3)
  ---------------------------------------------------------------------------
  FIX-T3-11  UNPARSEABLE CSV VALUES: pd.to_numeric(errors='coerce') silently
@@ -906,6 +955,16 @@ TIER3_TRAIN_CONFIG = dict(
                             #           epochs to jointly converge in log-space
     patience       = 40,    # was 30 — more tolerance for noisy val_MAE
     # Worst-case stop: min_epochs(60) + patience(40) = 100 = full training
+
+    # ── FIX-T3-PHASE-A: band_gap consolidation before k_measured fine-tune ──
+    # Run phase_a_epochs on full df_tier2 (band_gap primary target) before
+    # Phase B k_measured_log fine-tuning on the small HfO2-family set.
+    # Prevents catastrophic backbone forgetting: band_gap MAD:MAE 7.3 → 0.72
+    # without this fix.  Mirrors the proven Tier 2 phase_a_epochs=30 strategy.
+    # phase_a_lr: same gentle 1e-5 as Phase B to avoid overshooting Tier 2 opt.
+    phase_a_epochs = 20,
+    phase_a_target = "band_gap",
+    phase_a_lr     = 1e-5,
 )
 
 # -- FIX5: DFT functional codes ------------------------------------------------
@@ -961,9 +1020,27 @@ PROCESS_PARAMS_FEATURES: Dict[str, Any] = {
     ],
     "log_normalize": ["anneal_duration_min", "pressure_mTorr"],
     "categorical": {
-        "anneal_ambient": ["N2", "O2", "forming_gas", "vacuum"],
-        "precursor_type": ["TDMA-Hf", "HfCl4", "TEMAZ", "TDMAZ", "other"],
-        "oxidant_type":   ["H2O", "O3", "O2_plasma", "other"],
+        # BUG-5 FIX: expanded from 33-row seed CSV vocab to cover all values
+        # in the updated 120-row experimental CSV.  Old entries are kept at the
+        # SAME index positions so checkpoints loaded with strict=False remain
+        # compatible — new entries are appended after the originals.
+        # Unknown values still fall to the final "other" slot, but dominant
+        # precursors (TDMAH, TEMAH) and oxidants now get their own embeddings.
+        "anneal_ambient": [
+            "N2", "O2", "forming_gas", "vacuum",   # original indices 0-3
+            "Ar", "ambient", "other",               # BUG-5: new CSV values
+        ],
+        "precursor_type": [
+            "TDMA-Hf", "HfCl4", "TEMAZ", "TDMAZ", "other",  # original 0-4
+            "TDMAHf",  "TDMAH",                               # Hf TDMA variants
+            "TEMA-Hf", "TEMAH",                               # Hf TEMA variants
+            "TDMAZr",  "TMA",                                 # Zr + Al (HZO, HfAlO)
+        ],
+        "oxidant_type": [
+            "H2O", "O3", "O2_plasma", "other",     # original indices 0-3
+            "O2 plasma",                            # BUG-5: space variant in CSV
+            "O2", "H2O_O3",                         # BUG-5: additional CSV values
+        ],
     },
     "embed_dim":  8,    # per-categorical embedding dimension
     "output_dim": 64,   # final proc_emb dimension
@@ -1588,7 +1665,8 @@ class DatasetExtractor:
             "band_gap":                     "band_gap",     # already correct
             "Eg_eV":                        "band_gap",     # abbreviation
             # ── J_g (leakage current density) ─────────────────────────────────
-            "J_g_A_cm2_at_1v":             "J_g_A_cm2",   # actual CSV schema
+            "J_g_A_cm2_at_1V":             "J_g_A_cm2",   # BUG-1 FIX: uppercase V (actual CSV col)
+            "J_g_A_cm2_at_1v":             "J_g_A_cm2",   # lowercase v fallback for resilience
             "leakage_J_A_cm2_at_field":    "J_g_A_cm2",   # old CSV schema
             "leakage_current_J_A_cm2":     "J_g_A_cm2",   # alternative
             "J_g":                          "J_g_A_cm2",   # abbreviation
@@ -1652,22 +1730,36 @@ class DatasetExtractor:
         # Keys in PROCESS_PARAMS_FEATURES["categorical"]:
         #   anneal_ambient, precursor_type, oxidant_type
         proc_renames = {
-            "ald_substrate_temp_c":     "substrate_temp_C",
-            "deposition_temp_C":        "substrate_temp_C",
-            "anneal_temp_PDA_C":        "anneal_temp_C",
-            "post_anneal_temp_C":       "anneal_temp_C",
-            "anneal_duration":          "anneal_duration_min",
-            "anneal_duration_min":      "anneal_duration_min",
-            "ald_cycle_count":          "n_cycles",
-            "num_cycles_or_thickness":  "n_cycles",
-            "chamber_base_pressure_mTorr":      "pressure_mTorr",
-            "chamber_pressure":         "pressure_mTorr",
-             "anneal_atmosphere":       "anneal_ambient",
-            "post_anneal_atm":          "anneal_ambient",
-            "precursor_type_Hf":        "precursor_type",
-            "precursor_metal":          "precursor_type",
-            "precursor_oxidant":        "oxidant_type",
-            "oxidant_type":             "oxidant_type",
+            # ── Substrate / deposition temperature ────────────────────────────
+            # BUG-2 FIX: "ald_substrate_temp_c" had lowercase c → never fired.
+            # CSV column is "ald_substrate_temp_C" (uppercase C).
+            # substrate_temp_C was 0/120 rows — ProcessParamsEncoder blind to T_sub.
+            "ald_substrate_temp_C":         "substrate_temp_C",  # BUG-2 FIX: uppercase C
+            "ald_substrate_temp_c":         "substrate_temp_C",  # lowercase fallback
+            "deposition_temp_C":            "substrate_temp_C",  # old seed CSV compat
+            # ── Anneal temperature ────────────────────────────────────────────
+            "anneal_temp_PDA_C":            "anneal_temp_C",
+            "post_anneal_temp_C":           "anneal_temp_C",
+            # ── Anneal duration (unit-aware string parse applied below) ───────
+            "anneal_duration":              "anneal_duration_min",
+            "anneal_duration_min":          "anneal_duration_min",
+            # ── Cycle count ───────────────────────────────────────────────────
+            "ald_cycle_count":              "n_cycles",
+            "num_cycles_or_thickness":      "n_cycles",
+            # ── Chamber pressure ─────────────────────────────────────────────
+            # BUG-3 FIX: "chamber_base_pressure_mTorr" never matched CSV col
+            # "chamber_base_pressure_Torr". Also needs ×1000 Torr→mTorr below.
+            "chamber_base_pressure_Torr":   "pressure_mTorr",    # BUG-3 FIX: Torr suffix
+            "chamber_base_pressure_mTorr":  "pressure_mTorr",    # old name fallback
+            "chamber_pressure":             "pressure_mTorr",    # seed CSV compat
+            # ── Anneal atmosphere ─────────────────────────────────────────────
+            "anneal_atmosphere":            "anneal_ambient",
+            "post_anneal_atm":              "anneal_ambient",
+            # ── Precursor / oxidant ───────────────────────────────────────────
+            "precursor_type_Hf":            "precursor_type",
+            "precursor_metal":              "precursor_type",
+            "precursor_oxidant":            "oxidant_type",
+            "oxidant_type":                 "oxidant_type",
             # Unit-converting renames handled separately below (nm → Å)
         }
         df = df.rename(columns={k: v for k, v in proc_renames.items() if k in df.columns})
@@ -1688,6 +1780,71 @@ class DatasetExtractor:
             )
             df = df.drop(columns=["film_thickness_nm"])
             log.debug("FIX-T3-1: film_thickness_nm → film_thickness_A (×10)")
+
+        # BUG-3 FIX: Torr → mTorr unit conversion.
+        # After proc_renames, "pressure_mTorr" still holds values in Torr
+        # (renamed from chamber_base_pressure_Torr which stores Torr floats).
+        # ProcessParamsEncoder log1p-normalises pressure_mTorr; receiving Torr
+        # values (1e-7 to 0.2) instead of mTorr (1e-4 to 200) compresses the
+        # log1p range to near-zero, destroying the pressure signal entirely.
+        if "pressure_mTorr" in df.columns:
+            df["pressure_mTorr"] = (
+                pd.to_numeric(df["pressure_mTorr"], errors="coerce") * 1000.0
+            )
+            n_p = int(df["pressure_mTorr"].notna().sum())
+            log.debug(
+                "BUG-3 FIX: pressure_mTorr ← chamber_base_pressure_Torr ×1000  "
+                "(%d rows,  range [%.2e, %.2e] mTorr)",
+                n_p,
+                float(df["pressure_mTorr"].min()) if n_p > 0 else float("nan"),
+                float(df["pressure_mTorr"].max()) if n_p > 0 else float("nan"),
+            )
+
+        # BUG-4 FIX: anneal_duration unit-aware parsing.
+        # CSV stores values like "30s", "60 s", "20 min", "1h".
+        # pd.to_numeric() and _clean_numeric_series() both return NaN on these.
+        # anneal_duration_min was NaN for all 68 rows it maps via proc_renames.
+        # Parse to float minutes so log1p normalisation works correctly.
+        if "anneal_duration_min" in df.columns:
+            import re as _re_dur
+
+            def _parse_duration_to_min(raw) -> float:
+                if raw is None or (isinstance(raw, float) and np.isnan(raw)):
+                    return float("nan")
+                s = str(raw).strip().lower()
+                if not s or s in ("nan", "none", "n/a", "-"):
+                    return float("nan")
+                # seconds: "30s", "60 s", "1800 sec", "30seconds"
+                m = _re_dur.match(r"^(\d+\.?\d*)\s*s(?:ec(?:onds?)?)?$", s)
+                if m:
+                    return float(m.group(1)) / 60.0
+                # minutes: "20min", "5 min", "10m", "10minutes"
+                m = _re_dur.match(r"^(\d+\.?\d*)\s*m(?:in(?:utes?)?)?$", s)
+                if m:
+                    return float(m.group(1))
+                # hours: "1h", "2 hr", "0.5 hours"
+                m = _re_dur.match(r"^(\d+\.?\d*)\s*h(?:r|ours?)?$", s)
+                if m:
+                    return float(m.group(1)) * 60.0
+                # bare number → assume minutes
+                try:
+                    return float(s)
+                except ValueError:
+                    log.debug(
+                        "BUG-4: anneal_duration_min unparseable value '%s' → NaN", raw
+                    )
+                    return float("nan")
+
+            n_before = int(df["anneal_duration_min"].notna().sum())
+            df["anneal_duration_min"] = df["anneal_duration_min"].apply(
+                _parse_duration_to_min
+            )
+            n_after = int(df["anneal_duration_min"].notna().sum())
+            log.debug(
+                "BUG-4 FIX: anneal_duration_min unit-parse: "
+                "%d non-null strings → %d valid floats (minutes)",
+                n_before, n_after,
+            )
 
         # Log process column coverage after rename so any future CSV schema
         # drift is immediately visible in the run log.
@@ -4767,6 +4924,7 @@ def run_tier3_finetune(
     df_tier3: pd.DataFrame,
     pretrained_weights: Path,
     ablate_context: bool = False,
+    df_tier2: Optional[pd.DataFrame] = None,
 ):
     """
     Tier 3 -- Project fine-tuning on HfO2-family (with process parameters).
@@ -4780,6 +4938,12 @@ def run_tier3_finetune(
     entries with real ALD/anneal process parameters. The ALIGNN backbone
     handles the crystal structure branch; a separate MLP handles process
     parameters. Both outputs are concatenated before task heads.
+
+    FIX-T3-PHASE-A: df_tier2 (all oxide dielectric rows) is used for a
+    20-epoch band_gap consolidation Phase A before k_measured_log Phase B.
+    This prevents the backbone from catastrophically forgetting band_gap
+    representations when fine-tuned on the small HfO2-family k set.
+    Pass df_tier2=None to skip Phase A (falls back gracefully with WARNING).
     """
     log.info("=" * 70)
     log.info(" TIER 3 -- Project Fine-tune (HfO2 Family)")
@@ -4964,6 +5128,75 @@ def run_tier3_finetune(
 
     trainer = ALIGNNTrainer(model, cfg, ckpt_prefix="tier3",
                             ablate_context=ablate_context)
+
+    # ── FIX-T3-PHASE-A: band_gap consolidation on full oxide dataset ──────────
+    # Before Phase B k_measured_log fine-tuning, run phase_a_epochs on df_tier2
+    # (all oxide rows with band_gap) to anchor backbone representations.
+    #
+    # Why needed:
+    #   - Tier 3 k_measured_log set has ~50-80 rows; df_tier2 has ~5K band_gap
+    #   - k_measured_log task weight 2.0× with tiny dataset pulls backbone away
+    #     from Tier 2 band_gap representations → MAD:MAE 7.3 → 0.72 collapse
+    #   - 20 Phase A epochs on df_tier2 refreshes band_gap gradient and anchors
+    #     the backbone before the HfO2-family k_measured signal takes over
+    #   - early_stopping=False: fixed consolidation run, not a convergence run
+    #   - trainer.optimizer is saved/restored so Phase B uses the original AdamW
+    phase_a_epochs = cfg.get("phase_a_epochs", 0)
+    if phase_a_epochs > 0 and df_tier2 is not None:
+        df_pa = df_tier2[df_tier2["band_gap"].notna()].copy()
+        log.info("─" * 68)
+        log.info(
+            "TIER 3 PHASE A: band_gap consolidation  "
+            "rows=%d  epochs=%d  lr=%.2e",
+            len(df_pa), phase_a_epochs,
+            cfg.get("phase_a_lr", cfg["learning_rate"]),
+        )
+        log.info(
+            "  Purpose: anchor backbone band_gap representations before "
+            "Phase B k_measured_log fine-tuning on %d HfO2-family rows.",
+            int(df_structural[cfg["target"]].notna().sum()),
+        )
+        pa_loader, _, _, pa_sampler = build_dataloader(
+            df         = df_pa,
+            target_col = "band_gap",
+            aux_cols   = ["formation_energy_per_atom"],
+            train_frac = 0.95,
+            val_frac   = 0.05,
+            batch_size = cfg["batch_size"],
+        )
+        pa_optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr           = cfg.get("phase_a_lr", cfg["learning_rate"]),
+            weight_decay = cfg["weight_decay"],
+        )
+        _saved_cfg        = trainer.cfg
+        _saved_optimizer  = trainer.optimizer
+        trainer.cfg       = {**cfg, "epochs": phase_a_epochs, "early_stopping": False}
+        trainer.optimizer = pa_optimizer
+        sched_pa = trainer.build_scheduler(len(pa_loader), phase_a_epochs)
+        for epoch in range(1, phase_a_epochs + 1):
+            ep = trainer.train_epoch(pa_loader, sched_pa, "band_gap")
+            log.info(
+                "Tier 3 Phase A  ep %3d/%d  loss=%.4f  proc_avail=%.1f%%",
+                epoch, phase_a_epochs,
+                ep["loss"],
+                ep.get("proc_avail_pct", 0.0),
+            )
+        trainer.cfg       = _saved_cfg
+        trainer.optimizer = _saved_optimizer
+        log.info(
+            "Tier 3 Phase A complete — starting Phase B k_measured_log fine-tuning"
+        )
+        log.info("─" * 68)
+    elif phase_a_epochs > 0 and df_tier2 is None:
+        log.warning(
+            "FIX-T3-PHASE-A: phase_a_epochs=%d requested but df_tier2=None. "
+            "Pass df_tier2 to run_tier3_finetune() to enable Phase A consolidation. "
+            "Skipping — band_gap performance may degrade significantly.",
+            phase_a_epochs,
+        )
+
+    # ── Phase B: k_measured_log fine-tuning on HfO2-family ───────────────────
     history = trainer.train(train_loader, val_loader, target_col=cfg["target"], train_sampler=train_sampler)
 
     # FIX2+MAD:MAE: load best checkpoint then evaluate all task heads
@@ -4972,40 +5205,139 @@ def run_tier3_finetune(
         ckpt = torch.load(best_ckpt, map_location="cpu")
         trainer.model_core.load_state_dict(ckpt["model_state_dict"])
 
-    test_mae, test_rmse = trainer.evaluate(test_loader, cfg["target"])
+    # FIX-T3-LINMAE: use return_preds=True for exact exp-space MAE.
+    # Previous code: (exp(log_MAE)-1)*100 — only correct when all k equal k_mean.
+    # Exact formula: mean|exp(pred_log) - exp(true_log)|.  Mirrors Tier 2 ~L4454.
+    # Previous MAD:MAE=0.14 was a log-space artifact: MAD≈0 because all 5 test
+    # samples were near-identical monoclinic HfO2 (log(k)≈log(22)≈3.09 for all).
+    # New block computes MAD on linear-k and gives pass/fail vs benchmarks.
+    import math as _math
+
+    test_mae_log, test_rmse_log, preds_log, trues_log = trainer.evaluate(
+        test_loader, cfg["target"], return_preds=True
+    )
+
     log.info("─" * 68)
     log.info("TIER 3 TEST RESULTS")
     log.info("─" * 68)
-    if cfg.get("log_transform", False):
-        import math as _math
-        mae_k_exact  = (_math.exp(test_mae) - 1) * 100   # approx % error
-        log.info("  log(k_measured)  MAE  = %.4f  [log units]", test_mae)
-        log.info("  log(k_measured)  RMSE = %.4f", test_rmse)
-        log.info("  exp(MAE)             = %.4fx  → ≈%.1f%% average relative error",
-                 _math.exp(test_mae), mae_k_exact)
-        log.info("  Benchmark: ALIGNN paper MAD:MAE ≥ 1.63 (linear-k, 44K JARVIS)")
-        log.info("  Goal: MAD:MAE ≥ 2.5 (log-k, three-tier transfer learning)")
-    else:
-        log.info("  k_measured (linear)  MAE  = %.4f  [dielectric units]", test_mae)
-        log.info("  k_measured (linear)  RMSE = %.4f", test_rmse)
 
+    if cfg.get("log_transform", False):
+        # ── Diagnostic: log-space (training metric, not the benchmark) ────────
+        log.info(
+            "  Diagnostic log-space  MAE  = %.4f  [log(k) units]", test_mae_log
+        )
+        log.info("  Diagnostic log-space  RMSE = %.4f", test_rmse_log)
+        log.info(
+            "  exp(MAE)                  = %.4f×  → ±%.1f%% avg relative error",
+            _math.exp(test_mae_log),
+            (_math.exp(test_mae_log) - 1) * 100,
+        )
+        log.info("")
+
+        # ── Primary: exact linear-k (publication / benchmark metric) ──────────
+        valid_mask = ~torch.isnan(trues_log)
+        n_valid    = int(valid_mask.sum())
+        if n_valid > 0:
+            p_lin = torch.exp(preds_log[valid_mask])
+            t_lin = torch.exp(trues_log[valid_mask])
+            mae_k_linear   = (p_lin - t_lin).abs().mean().item()
+            rmse_k_linear  = ((p_lin - t_lin) ** 2).mean().sqrt().item()
+            t_np           = t_lin.cpu().numpy()
+            mad_k_linear   = float(np.median(np.abs(t_np - np.median(t_np))))
+            mad_mae_linear = (
+                mad_k_linear / mae_k_linear if mae_k_linear > 0 else float("nan")
+            )
+            log.info(
+                "  PRIMARY (linear-k exact)  MAE  = %.4f  [dielectric units]",
+                mae_k_linear,
+            )
+            log.info(
+                "  PRIMARY (linear-k exact)  RMSE = %.4f  [dielectric units]",
+                rmse_k_linear,
+            )
+            log.info(
+                "  PRIMARY (linear-k exact)  MAD  = %.4f  "
+                "→ MAD:MAE = %.2f  (N=%d)",
+                mad_k_linear, mad_mae_linear, n_valid,
+            )
+            log.info("─" * 68)
+            if mad_mae_linear >= 2.5:
+                log.info(
+                    "  STATUS: ✓ PROJECT GOAL MET  "
+                    "(MAD:MAE %.2f ≥ 2.5)", mad_mae_linear
+                )
+            elif mad_mae_linear >= 1.63:
+                log.info(
+                    "  STATUS: ✓ PAPER BENCHMARK MET  "
+                    "(MAD:MAE %.2f ≥ 1.63) — push toward 2.5 goal",
+                    mad_mae_linear,
+                )
+            else:
+                log.info(
+                    "  STATUS: ✗ BELOW PAPER BENCHMARK  "
+                    "(MAD:MAE %.2f < 1.63) — check data count "
+                    "and process encoder activation",
+                    mad_mae_linear,
+                )
+        else:
+            log.warning(
+                "  No valid k_measured predictions on test set (n_valid=0). "
+                "Check --rebuild_tier3 log for k_measured_log coverage."
+            )
+            mae_k_linear = rmse_k_linear = mad_k_linear = mad_mae_linear = float("nan")
+            n_valid = 0
+
+    else:
+        # Non-log-transform fallback — should not be reached in normal Tier 3
+        test_mae_log, test_rmse_log = trainer.evaluate(test_loader, cfg["target"])
+        log.info(
+            "  k_measured (linear)  MAE  = %.4f  [dielectric units]", test_mae_log
+        )
+        log.info("  k_measured (linear)  RMSE = %.4f", test_rmse_log)
+        mae_k_linear = test_mae_log
+        rmse_k_linear = test_rmse_log
+        mad_k_linear = mad_mae_linear = float("nan")
+        n_valid = 0
+
+    # ── Multi-task table (all heads) ─────────────────────────────────────────
     mt_results = trainer.evaluate_multitask(test_loader, cfg, df_full=df_structural)
     trainer.print_multitask_results(mt_results, split_name="TEST", tier_name="TIER 3")
 
-    # Project-specific MAD:MAE summary for k_measured
-    if "k_measured" in mt_results and mt_results["k_measured"]["n"] > 0:
-        km = mt_results["k_measured"]
-        log.info(
-            "k_measured MAD=%.2f  MAE=%.4f  MAD:MAE=%.2f  "
-            "(paper: 1.63 @ 44K no transfer | goal: >= 2.5 with three-tier transfer)",
-            km["mad"], km["mae"], km["mad_mae_ratio"],
-        )
+    # ── Final summary (linear-k, matches Tier 2 reporting format) ────────────
+    log.info("─" * 68)
+    log.info("TIER 3 FINAL SUMMARY  (linear-k, exact exp-space)")
+    log.info(
+        "  k_measured  MAE=%.4f  RMSE=%.4f  MAD=%.4f  MAD:MAE=%.2f  N=%d",
+        mae_k_linear, rmse_k_linear, mad_k_linear, mad_mae_linear, n_valid,
+    )
+    log.info(
+        "  paper benchmark: MAD:MAE ≥ 1.63 (44K JARVIS, no transfer)  |  "
+        "project goal: MAD:MAE ≥ 2.5 (three-tier + process conditioning)"
+    )
 
     out_path = REPORT_ROOT / "tier3_test_results.json"
+    primary_metrics = {
+        # Log-space (training diagnostic)
+        "mae_log_k":          test_mae_log,
+        "rmse_log_k":         test_rmse_log,
+        "exp_mae_multiplier": (
+            _math.exp(test_mae_log) if cfg.get("log_transform") else float("nan")
+        ),
+        # Linear-k exact (FIX-T3-LINMAE — publication / benchmark metric)
+        "mae_linear_k":       mae_k_linear,
+        "rmse_linear_k":      rmse_k_linear,
+        "mad_linear_k":       mad_k_linear,
+        "mad_mae_linear_k":   mad_mae_linear,
+        "n_test":             n_valid,
+        # Canonical aliases for downstream comparison scripts
+        "mae":                mae_k_linear,
+        "rmse":               rmse_k_linear,
+        "benchmark_scale":    "linear",
+        "diagnostic_scale":   "log",
+    }
     with open(out_path, "w") as f:
-        json.dump({"primary_mae": test_mae, "primary_rmse": test_rmse,
-                   "multitask": mt_results}, f, indent=2)
-    log.info("Tier 3 test results saved -> %s", out_path)
+        json.dump({"primary": primary_metrics, "multitask": mt_results}, f, indent=2)
+    log.info("Tier 3 test results saved → %s", out_path)
 
     return CKPT_ROOT / "tier3_best.pt"
 
@@ -5777,7 +6109,8 @@ def main():
                       "Run tier2_finetune first.", t2_ckpt)
             return
         run_tier3_finetune(df_tier3, t2_ckpt,
-                           ablate_context=args.ablate_context)
+                           ablate_context=args.ablate_context,
+                           df_tier2=df_tier2)
 
     log.info("Pipeline complete. Final model: %s/tier3_best.pt", CKPT_ROOT)
 
