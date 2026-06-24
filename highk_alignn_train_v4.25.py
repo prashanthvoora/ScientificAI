@@ -1069,7 +1069,7 @@ log = logging.getLogger(__name__)
 # -- Target element groups -----------------------------------------------------
 TIER3_ELEMENTS  = {"Hf", "Zr"}          # primary HfO2 family
 
-# High-k oxide elements used as structural donal pool for experimental rows
+# High-k oxide elements used as structural donor pool for experimental rows
 HIGH_K_DONOR_ELEMENTS = {"Hf","Zr","Al","Ti","Ta","Sr","La","Y",
                          "Ba","Nb","Ga","In","Sc","Ce","Pr","Nd"}
 
@@ -3885,7 +3885,7 @@ class HighKALIGNN(nn.Module):
         log.info("All layers unfrozen for fine-tuning.")
 
     def freeze_backbone(self):
-        """Freeze the ALIGNN backbone; keep task_heads, context, encoders, alpha/beta trainable."""
+        """Freeze ALIGNN backbone; keep task_heads, context, encoders, alpha/beta trainable."""
         for param in self.backbone.parameters():
             param.requires_grad = False
         for param in self.context_proj.parameters():
@@ -3902,7 +3902,7 @@ class HighKALIGNN(nn.Module):
             param.requires_grad = True
         for param in self.func_proj.parameters():
             param.requires_grad = True
-        log.info(" ALIGNN backbone frozen. Training: task_heads, context_proj, encoders, alpha/beta, functional conditioning.")
+        log.info(" ALIGNN backbone frozen. Training: task_heads, context_proj, proc_encoder, stack_encoder alpha, beta, func_embedding")
 
     def unfreeze_backbone(self, lr=None):
         """Unfreeze the ALIGNN backbone for gentle joint adaptation after Phase B."""
@@ -5017,7 +5017,7 @@ def build_dataloader(
         train_indices = list(range(len(train_ds)))
         try:
             proc_avail = [
-                int(dataset.df_loc[dataset.valid_idx[i], "source"] == "Experimental")
+                int(dataset.df.loc[dataset.valid_idx[i], "source"] == "Experimental")
                 for i in train_indices
             ]
         except Exception:
@@ -5933,19 +5933,19 @@ def run_tier3_finetune(
 
     # ── PHASE-A: band_gap consolidation on Tier 3 structural data ──────────
 
-    phase_a_steps = cfg.get("phase_a_steps")
+    phase_a_steps = cfg["phase_a_steps"]
 
     if phase_a_steps > 0 and len(df_structural) > 0:
         df_pa = df_structural[df_structural["band_gap"].notna()].copy()
         log.info("─" * 68)
         log.info(
             "TIER 3 PHASE A: band_gap consolidation (Tier 3 data) "
-            "rows=%d  budget=%d %s  lr=%.2e",
+            "rows=%d  budget=%d  lr=%.2e",
             len(df_pa), phase_a_steps,cfg["phase_a_lr"],
         )
         phase_b_steps = int(_n_phase_b * cfg["train_ratio"] / cfg["batch_size"]) * cfg.get("epochs", 100)
         log.info(
-            "  Purpose: anchor backbone in Hfo2 faily representation subspace  "
+            "  Purpose: anchor backbone in HfO2 family representation subspace  "
             "before Phase B k_total_log fine-tuning"
             "Phase A:Phase B step ratio = %d:%d = %.2fx",
             phase_a_steps, phase_b_steps, phase_a_steps / max(phase_b_steps, 1)
@@ -5954,7 +5954,7 @@ def run_tier3_finetune(
         pa_loader, _, _, pa_sampler, _ds = build_dataloader(
             df         = df_pa,
             target_col = "band_gap",
-            aux_cols   = ["formation_energy_per_atom"],
+            aux_cols   = [],
             train_frac = 0.95,
             val_frac   = 0.05,
             batch_size = cfg["batch_size"],
@@ -6025,10 +6025,10 @@ def run_tier3_finetune(
         log.info("─" * 68)
         log.info(
             "Tier 3 Phase B: backbone-free, Singele task k_total_log fine-tuning"
-            "rows=%d  epochs=%d  lr≈%d  batch_size=%s",
+            "rows=%d  epochs=%d  lr≈%.2e  batch_size=%d",
             _n_phase_b, cfg["epochs"], cfg["learning_rate"], cfg["batch_size"]
         )
-        log.info("Frozen : ALLIGN backbone (all message passing layers)")
+        log.info(" Frozen : ALLIGN backbone (all message passing layers)")
         log.info(" Training task_heads, context_proj, proc_encoder, stack_encoder, alpha, beta")
 
         # Build Phase B dataloader with single task targets (k_total_log only)
@@ -6077,12 +6077,12 @@ def run_tier3_finetune(
 
         log.info("─" * 68)
         log.info(
-            "Tier 3 Phase B2: Unfreeze backbone, Singele task"
-            "epochs=%d  backbone≈%d  batch_size=%s",
+            "TIER 3 PHASE B2: Unfreeze backbone, Single-task"
+            "epochs=%d  backbone_lr≈%.2e  batch_size=%d",
             b2_epochs, unfreeze_lr, cfg["batch_size"]
         )
-        log.info("UnFreezing backbone at lr = %.2e (lower than Phase B lr = %.2e)", unfreeze_lr, cfg["learning_rate"])
-        log.info(" Single Task: k_total_log only (no aux heads)")
+        log.info("UnFreezing backbone at lr = %.2e (lower than Phase B lr=%.2e)", unfreeze_lr, cfg["learning_rate"])
+        log.info(" Single-task: k_total_log only (no aux heads)")
 
         model.unfreeze_backbone(lr=unfreeze_lr)
 
@@ -6590,7 +6590,7 @@ def run_tier_evaluate(
                 log.info(
                     "Tier 3 %d k-valid rows without atoms_dict dropped "
                     "(split will be on %d structural k-valid rows)",
-                    n_dropped, len(df_eval)
+                    n_dropped, len(df_eval),
                 )
         else:
             df_eval = df_kvalid
@@ -6657,8 +6657,10 @@ def run_tier_evaluate(
         # Tier 3 primary is k_measured in linear space
         valid = ~torch.isnan(trues_t)
         if valid.sum() > 0:
-           mae_k_exact = (torch.exp(preds_t[valid]) - torch.exp(trues_t[valid])).abs().mean().item()
-           rmse_k_exact = ((torch.exp(preds_t[valid]) - torch.exp(trues_t[valid]))  ** 2).mean().sqrt().item()
+           mae_k_exact = (torch.exp(preds_t[valid]) -
+                          torch.exp(trues_t[valid])).abs().mean().item()
+           rmse_k_exact = ((torch.exp(preds_t[valid]) -
+                            torch.exp(trues_t[valid]))  ** 2).mean().sqrt().item()
         else:
             mae_k_exact = rsme_k_exact = float("nan")
         log.info(" Diagnostic log-space MAE = %.4f [log(k) units]", test_mae_log)
@@ -6677,7 +6679,9 @@ def run_tier_evaluate(
         log.info("  RMSE = %.4f", test_rmse_log)
 
     # ── Full multitask table ──────────────────────────────────────────────────
-    mt_results = trainer.evaluate_multitask(test_loader, cfg, df_full=test_dataset.df)
+    mt_results = trainer.evaluate_multitask(
+        test_loader, cfg, df_full=test_dataset.df
+    )
     trainer.print_multitask_results(
         mt_results, split_name="TEST", tier_name=tier_label
     )
@@ -6817,7 +6821,7 @@ def main():
                 log.error(" Tier1 HDF5 is not found at %s. Run tier1_pretrain first.",t1_hdf5)
                 return
             if not t2_hdf5.exists():
-                log.error(" Tier2 HDF5 is not found at %s. Run tier2_pretrain first.",t2_hdf5)
+                log.error(" Tier2 HDF5 is not found at %s. Run tier2_finetune first.",t2_hdf5)
                 return
             df_tier1=pd.read_hdf(t1_hdf5, key="data")
             df_tier2=pd.read_hdf(t2_hdf5, key="data")
@@ -6837,7 +6841,7 @@ def main():
             if len(df_process_only) > 0 and len(df_structural) > 0:
                 df_donor_pool_wide = df_tier2[
                     df_tier2["formula"].apply(
-                        lambda f: isinstance(f, str) and "0" in f and 
+                        lambda f: isinstance(f, str) and "O" in f and
                                 any(el in f for el in HIGH_K_DONOR_ELEMENTS)
                     )
                     ].copy()
@@ -6846,15 +6850,16 @@ def main():
                     df_process_only, df_donor_pool_wide
                 )
                 if len(df_imputed) > 0:
+                    # Merge imputed rows back
                     df_tier3 = pd.concat(
                         [df_structural, df_imputed, df_unmatched], ignore_index=True
                     )
 
-            log.info("Tier 3 rebuild: %d rows (k_measured non-null : %d)",
+            log.info("Tier 3 rebuilt: %d rows (k_measured non-null : %d)",
                     len(df_tier3), int(df_tier3["k_measured"].notna().sum()))
             # use rebuilt data directly (with imputed atoms_dict) instead of
             # loading from the old HDF5 cache which lacks imputed structures.
-            df_eval=df_tier3
+            df_eval = df_tier3
             log.info("Using rebuilt Tier3 dataset (with structure imputation)")
           
         else:
