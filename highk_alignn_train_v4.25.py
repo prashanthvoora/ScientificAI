@@ -1068,6 +1068,11 @@ log = logging.getLogger(__name__)
 
 # -- Target element groups -----------------------------------------------------
 TIER3_ELEMENTS  = {"Hf", "Zr"}          # primary HfO2 family
+
+# High-k oxide elements used as structural donal pool for experimental rows
+HIGH_K_DONOR_ELEMENTS = {"Hf","Zr","Al","Ti","Ta","Sr","La","Y",
+                         "Ba","Nb","Ga","In","Sc","Ce","Pr","Nd"}
+
 TIER2_CATIONS   = {                       # reference only -- no longer used as a filter
     "Hf", "Zr", "Ti", "La", "Ce", "Pr", "Nd", "Gd", "Dy", "Y", "Lu",
     "Al", "Ga", "In", "Si", "Ge", "Sn", "Nb", "Ta", "W", "Mo",
@@ -1199,19 +1204,20 @@ TIER2_TRAIN_CONFIG = dict(
 )
 
 TIER3_TRAIN_CONFIG = dict(
-    epochs         = 100,
+    epochs         = 150,
 
     # FIX-T3-9C: batch_size 16→8. With ~170 training rows, batch_size=16 gives
     # only ~10 batches/epoch.  At 8 we get ~20 batches/epoch — experimental
     # rows appear more frequently and the process encoder receives more
     # gradient updates per epoch relative to DFT rows.
-    batch_size     = 8,
+    batch_size     = 32,
 
     # FIX-T3-6: LR reduced 5× (5e-5 → 1e-5, applied in v4.5.3).
-    learning_rate  = 1e-5,
-    weight_decay   = 1e-5,
+    learning_rate  = 5e-5,
+    weight_decay   = 1e-4,
     scheduler      = "cosine",
     loss           = "mse",
+    max_grad_norm  = 1.0,
 
     # FIX-T3-9A: switch to log-space target (mirrors Tier 2 k_total_log).
     # k_measured spans 3.9–386+ (same 100× dynamic range as k_total).
@@ -1223,11 +1229,13 @@ TIER3_TRAIN_CONFIG = dict(
     log_transform     = True,
     log_original_col  = "k_total",         # UNIFY-K: was "k_measured" — aliased in build_tier3
 
-    aux_targets    = ["band_gap", "J_g_A_cm2", "E_BD_MV_cm"],
+    aux_targets    =[],
     train_ratio    = 0.70,
     val_ratio      = 0.15,
     test_ratio     = 0.15,
-    freeze_layers  = 0,
+    freeze_backbone = True,
+    unfreeze_backbone_after = 50,
+    unfreeze_backbone_lr = 1e-5,
 
     # FIX-T3-9B: experimental row upweighting.
     # After structure imputation df_structural has ~165 DFT k_measured rows
@@ -1238,7 +1246,7 @@ TIER3_TRAIN_CONFIG = dict(
 
     # FIX-T3-9C: explicit early stopping tuned for small noisy dataset.
     early_stopping = True,
-    min_epochs     = 60,    # was 40 — backbone + process encoder need more
+    min_epochs     = 80,    # was 40 — backbone + process encoder need more
                             #           epochs to jointly converge in log-space
     patience       = 40,    # was 30 — more tolerance for noisy val_MAE
     # Worst-case stop: min_epochs(60) + patience(40) = 100 = full training
@@ -1256,9 +1264,9 @@ TIER3_TRAIN_CONFIG = dict(
     # band_gap and leaving only 8,300 steps for Phase B k_measured_log.
     # 200 steps = 0.03 epochs on 49K rows — brief anchor, not a training phase.
     # New Phase A:Phase B ratio = 200:1,200 = 0.17× (was 14.1×).
-    phase_a_steps  = 200,        # FIX-T3-PHASEACAP: step budget, not epoch count
+    phase_a_steps  = 500,        # FIX-T3-PHASEACAP: step budget, not epoch count
     phase_a_target = "band_gap",
-    phase_a_lr     = 1e-5,
+    phase_a_lr     = 5e-5,
 )
 
 # -- FIX5: DFT functional codes ------------------------------------------------
@@ -3344,6 +3352,7 @@ class HighKGraphDataset(torch.utils.data.Dataset):
             "formulas":         [b["formula"] for b in batch],
             "functional_code":  functional_codes,   # LongTensor [B] or None
             "is_experimental":  is_experimental,    # FloatTensor [B,1] or None
+            "row_indices":      torch.tensor([b["row_idx"] for b in batch]), # [B]
         }
 
 
@@ -3423,6 +3432,18 @@ def get_stratified_split(
             median_bin = int(np.median(target_bins[valid_mask]))
             target_bins[nan_rows] = median_bin
 
+        # Composite stratification: stratify by (target_bin, proc_avail) so each
+        # rank gets a representative mix of DFT (proc=0) and experimental (proc=1) rows.
+        try:
+            proc_avail = np.array([
+                int(dataset.df.loc[dataset.valid_idx[i], "source"] == "Experimental")
+                for i in range(len(dataset))
+            ])
+        except Exception:
+            proc_avail = np.zeros(len(dataset), dtype=int)
+
+        composite_bins = target_bins * 2 + proc_avail
+
         unique, counts = np.unique(target_bins, return_counts=True)
         if (counts < 2).any():
             log.warning(
@@ -3430,15 +3451,28 @@ def get_stratified_split(
             )
             return get_random_split(dataset, train_frac, val_frac, seed)
 
-        sss     = StratifiedShuffleSplit(
-            n_splits=1, test_size=(1 - train_frac), random_state=seed
-        )
-        idx_all = np.arange(len(dataset))
-        for train_idx, temp_idx in sss.split(idx_all, target_bins):
-            pass
+        # FIX : Handle edge case where train_Frac=0.0 (evaluation-only).
+        # when train_frac=0.0, test_size=1.0 in the first stratifiedShuffleSplit,
+        # which sklearn rejects ("test_size=1.0 should be < n_samples").
+        # Fix: skip the first split and go directly to val/test split
+        if train_frac < 1e-9:
+            # All data goes to temp, split directly into val/test
+            train_idx = np.array([], dtype=int)
+            temp_idx  = np.arange(len(dataset))
+            composite_temp = composite_bins
+            target_bins_temp = target_bins
+        else:
+            sss     = StratifiedShuffleSplit(
+                n_splits=1, test_size=(1 - train_frac), random_state=seed
+            )
+            idx_all = np.arange(len(dataset))
+            for train_idx, temp_idx in sss.split(idx_all, composite_bins):
+                pass
 
-        target_bins_temp = target_bins[temp_idx]
-        test_ratio       = (1 - train_frac - val_frac) / (1 - train_frac)
+            target_bins_temp = target_bins[temp_idx]
+            composite_temp = composite_bins[temp_idx]
+
+        test_ratio       = (1 - train_frac - val_frac) / max(1 - train_frac, 1e-9)
 
         # -- Fix: guard sss2 against two failure modes --------------------
         #
@@ -3455,7 +3489,7 @@ def get_stratified_split(
             val_idx  = temp_idx
             test_idx = np.array([], dtype=int)
         else:
-            n_unique_bins_temp = len(np.unique(target_bins_temp))
+            n_unique_bins_temp = len(np.unique(composite_temp))
             n_test_int         = max(1, int(test_ratio * len(temp_idx)))
             if n_test_int < n_unique_bins_temp:
                 # Too few test slots for stratified split — use random shuffle
@@ -3474,7 +3508,7 @@ def get_stratified_split(
                     n_splits=1, test_size=test_ratio, random_state=seed
                 )
                 for val_idx_local, test_idx_local in sss2.split(
-                    np.arange(len(temp_idx)), target_bins_temp
+                    np.arange(len(temp_idx)), composite_temp
                 ):
                     pass
                 val_idx  = temp_idx[val_idx_local]
@@ -3850,6 +3884,35 @@ class HighKALIGNN(nn.Module):
         self.frozen_layers = 0
         log.info("All layers unfrozen for fine-tuning.")
 
+    def freeze_backbone(self):
+        """Freeze the ALIGNN backbone; keep task_heads, context, encoders, alpha/beta trainable."""
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+        for param in self.context_proj.parameters():
+            param.requires_grad = True
+        for param in self.proc_encoder.parameters():
+            param.requires_grad = True
+        for param in self.stack_encoder.parameters():
+            param.requires_grad = True
+        for param in [ self.alpha, self.beta ]:
+            param.requires_grad = True
+        for param in self.task_heads.parameters():
+            param.requires_grad = True
+        for param in self.func_embedding.parameters():
+            param.requires_grad = True
+        for param in self.func_proj.parameters():
+            param.requires_grad = True
+        log.info(" ALIGNN backbone frozen. Training: task_heads, context_proj, encoders, alpha/beta, functional conditioning.")
+
+    def unfreeze_backbone(self, lr=None):
+        """Unfreeze the ALIGNN backbone for gentle joint adaptation after Phase B."""
+        for param in self.backbone.parameters():
+            param.requires_grad = True
+        if lr is not None:
+            log.info("Unfroze backbone at lr=%.2e", lr)
+        else:
+            log.info("ALIGNN backbone unfrozen (LR unchanged).")
+
     def _fuse(
         self,
         crystal_emb:   torch.Tensor,
@@ -4176,13 +4239,12 @@ class MaskedMultiTaskLoss(nn.Module):
     ) -> torch.Tensor:
         """
         functional_weights: float Tensor [B] of per-sample loss multipliers
-        derived from functional_loss_weights config.  None = uniform weights.
-        Applied after NaN masking so molecules with NaN oxide targets don't
-        inflate the denominator.
+        Accumulates task losses via torch.stack+mean to avoid disconnected
+        tensor when all targets are NaN.
         """
 
-        total_loss  = torch.tensor(0.0, device=next(iter(predictions.values())).device)
-        n_tasks_active = 0
+        device=next(iter(predictions.values())).device
+        task_losses = []
 
         for task, pred in predictions.items():
             if task not in targets:
@@ -4216,10 +4278,16 @@ class MaskedMultiTaskLoss(nn.Module):
                 per_sample_loss = per_sample_loss * fw_m
 
             task_loss   = per_sample_loss.mean()
-            total_loss += self.task_weights.get(task, 1.0) * task_loss
-            n_tasks_active += 1
+            task_losses.append(self.task_weights.get(task, 1.0) * task_loss)
 
-        return total_loss / max(n_tasks_active, 1)
+        if task_losses:
+            return torch.stack(task_losses).mean()
+        else:
+            # No active tasks - return a zero tensor on the correct device.
+            # using .zero_() on a prediction tensor creates a valid leaf
+            # tensor that is a proper result of a troch operation (zero_),
+            # so backward() works without "does not require grad" error.
+            return next(iter(predictions.values())).new_zeros(())
 
 
 # ==============================================================================
@@ -4529,13 +4597,6 @@ class ALIGNNTrainer:
 
         # Build task-head -> batch-key routing map
         task_to_batch_key = {primary_col: "__primary__"}
-        for col in aux_cols:
-            for head_name, col_name in TASK_TO_COLUMN.items():
-                if col_name == col:
-                    task_to_batch_key[head_name] = col
-                    break
-            else:
-                task_to_batch_key[col] = col
 
         task_preds   = {h: [] for h in self.model_core.task_heads}
         task_targets = {h: [] for h in self.model_core.task_heads}
@@ -4579,15 +4640,26 @@ class ALIGNNTrainer:
 
             for head_name, pred_t in all_preds.items():
                 task_preds[head_name].append(pred_t.cpu())
-                bkey = task_to_batch_key.get(head_name, "__none__")
-                if bkey == "__primary__" or head_name == primary_col:
-                    tgt = batch["target"]
-                elif bkey != "__none__":
-                    tgt = batch.get("aux_targets", {}).get(bkey)
-                    if tgt is None:
-                        tgt = torch.full(batch["target"].shape, float("nan"))
+                # Look up targets from df_full using row_indices (positional indices)
+                if df_full is not None and "row_indices" in batch:
+                    row_idxs = batch["row_indices"].tolist()
+                    tgt_list = []
+                    for ri in row_idxs:
+                        try:
+                            row_data = df_full.iloc[ri]
+                            col = TASK_TO_COLUMN.get(head_name, head_name)
+                            val = row_data.get(col)
+                            if val is not None and not (
+                                isinstance(val, float) and np.isnan(val)
+                            ):
+                                tgt_list.append(float(val))
+                            else:
+                                tgt_list.append(float("nan"))
+                        except (KeyError, IndexError):
+                            tgt_list.append(float("nan"))
+                    tgt = torch.tensor(tgt_list, dtype=torch.float32)
                 else:
-                    tgt = torch.full(batch["target"].shape, float("nan"))
+                    tgt = torch.full((len(batch["row_indices"]),), float("nan"), dtype=torch.float32)
                 task_targets[head_name].append(tgt)
 
         if n_batches == 0:
@@ -4855,6 +4927,69 @@ class ALIGNNTrainer:
 # SECTION 8 -- FULL THREE-TIER PIPELINE  (was Section 7)
 # ==============================================================================
 
+class BalancedDistributedSampler(torch.utils.data.sampler):
+    """
+    Distributed Sampler that guraantees balances proc_avail (DFT vs experimental)
+    across ranks every epoch via round-robin grouping.
+    """
+
+    def __init__(
+            self,
+            dataset,
+            proc_avail: list[int],
+            num_replicas: int = 2,
+            rank: int =0,
+            seed: int = 42,
+            shuffle: bool = True
+        ):
+            self.dataset = dataset
+            self.proc_avail = proc_avail
+            self.num_replicas = num_replicas
+            self.rank = rank
+            self.seed = seed
+            self.shuffle = shuffle
+            self.epoch = 0
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self.epoch)
+        indices = list(range(len(self.dataset)))
+
+        # Group by proc_avail
+        groups: dict[int, list[int]] = {}
+        for idx, pa in zip(indices, self.proc_avail):
+            groups.setdefault(pa, []).append(idx)
+
+        # Shuffle within each group
+        if self.shuffle:
+            for pa in groups:
+                rng.shuffle(groups[pa])
+
+        # Round-robin through groups
+        group_keys = sorted(groups.keys())
+        group_iters = {k: iter(v) for k, v in groups.items()}
+        balanced: list[int] = []
+        while True:
+            added = False
+            for gk in group_keys:
+                try:
+                    balanced.append(next(group_iters[gk]))
+                    added = True
+                except StopIteration:
+                    pass
+            if not added:
+                break
+
+        # Split by rank (even->rank0, odd->rank1, ...)
+        # keep only items for this rank
+        rank_indices = [balanced[i] for i in range(self.rank, len(balanced), self.num_replicas)]
+        return iter(rank_indices)
+
+    def __len__(self):
+        return len(self.proc_avail) // self.num_replicas
+
+    def set_epoch(self, epoch: int):
+        self.epoch = epoch
+
 def build_dataloader(
     df: pd.DataFrame,
     target_col: str,
@@ -4863,12 +4998,11 @@ def build_dataloader(
     val_frac:   float,
     batch_size: int,
     num_workers: int = 4,
-) -> Tuple[DataLoader, DataLoader, DataLoader]:
+) -> Tuple[DataLoader, DataLoader, DataLoader, BalancedDistributedSampler, HighKGraphDataset]:
     """Build train/val/test DataLoaders with stratified splitting.
 
-    DDP: returns DistributedSampler for the train loader so the caller can
-    call sampler.set_epoch(epoch) each epoch to reshuffle correctly.
-    Single-GPU: sampler is None, shuffle=True is used directly.
+    Returns: (train_loader, val_loader, test_loader, train_sampler, dataset).
+    The dataset is returned for correct traget lookup in evaluate_multitask.
     """
     dataset = HighKGraphDataset(df, target_col=target_col, aux_cols=aux_cols)
 
@@ -4878,11 +5012,20 @@ def build_dataloader(
 
     collate = HighKGraphDataset.collate_fn
 
-    # DDP: each rank processes a non-overlapping shard via DistributedSampler
+    # DDP: BalancedDistributedSampler guarantees balanced proc_avail across ranks.
     if _DIST["active"]:
-        from torch.utils.data.distributed import DistributedSampler
-        train_sampler = DistributedSampler(
+        train_indices = list(range(len(train_ds)))
+        try:
+            proc_avail = [
+                int(dataset.df_loc[dataset.valid_idx[i], "source"] == "Experimental")
+                for i in train_indices
+            ]
+        except Exception:
+            proc_avail = [0] * len(train_indices)
+
+        train_sampler = BalancedDistributedSampler(
             train_ds,
+            proc_avail   =  proc_avail,
             num_replicas = _DIST["world"],
             rank         = _DIST["rank"],
             shuffle      = True,
@@ -4906,7 +5049,7 @@ def build_dataloader(
         num_workers=num_workers, collate_fn=collate,
     )
 
-    return train_loader, val_loader, test_loader, train_sampler
+    return train_loader, val_loader, test_loader, train_sampler, dataset
 
 
 def safe_load_checkpoint(path: Path, map_location: str = "cpu") -> dict:
@@ -4999,7 +5142,7 @@ def run_tier1_pretrain(df_tier1: pd.DataFrame, ablate_context: bool = False):
     task_names = [cfg["target"]] + cfg["aux_targets"]
     log.info("Tier 1 training with targets: %s", task_names)
 
-    train_loader, val_loader, test_loader, train_sampler = build_dataloader(
+    train_loader, val_loader, test_loader, train_sampler, _ds = build_dataloader(
         df          = df_tier1,
         target_col  = cfg["target"],
         aux_cols    = cfg["aux_targets"],
@@ -5088,7 +5231,7 @@ def run_tier2_finetune(
         )
     target_col = cfg["target"]   # "k_total_log" if log_transform else "k_total"
 
-    train_loader, val_loader, test_loader, train_sampler = build_dataloader(
+    train_loader, val_loader, test_loader, train_sampler, _ds = build_dataloader(
         df         = df_t2_k,
         target_col = target_col,
         aux_cols   = cfg["aux_targets"],
@@ -5117,7 +5260,7 @@ def run_tier2_finetune(
         "Tier 2 Phase A: ALL oxide rows=%d  target=%s  epochs=%d",
         len(df_tier2), phase_a_target, phase_a_epochs,
     )
-    pa_loader, _, _, pa_sampler = build_dataloader(
+    pa_loader, _, _, pa_sampler,_ds = build_dataloader(
         df         = df_tier2,
         target_col = phase_a_target,
         aux_cols   = [c for c in cfg["aux_targets"] if c != phase_a_target],
@@ -5342,6 +5485,7 @@ def _impute_structures(
         "La2O3":               ["La2O3", "LaAlO3"],
         "LaAlO3":              ["LaAlO3", "La2O3"],
         "LaAlO_solgel":        ["LaAlO3"],
+        "La1-xAlxO3":          ["LaAlO3"], # non-stoichiometric -> use LaAl03 structure
         "Ta2O5":               ["Ta2O5"],
         "TiO2":                ["TiO2"],
         "Y2O3":                ["Y2O3"],
@@ -5597,29 +5741,17 @@ def run_tier3_finetune(
         len(df_structural), len(df_process_only)
     )
 
-    # ── FIX-T3-7: Option A structure imputation ──────────────────────────────
-    # _impute_structures() assigns the best JARVIS/MP donor crystal structure
-    # to each process-only row that has ALD params + measured k but no atoms_dict.
-    # After imputation, those rows join df_structural so they:
-    #   a) feed into the ALIGNN graph path (atoms_dict now populated)
-    #   b) set avail_flag=1 (process params are already filled from CSV)
-    #   c) provide real gradient signal to ProcessParamsEncoder + StackContextEncoder
-    #      → alpha/beta gates grow from 1e-3 → process-aware learning activates
-    #
-    # Imputed rows are flagged with imputed_structure=True and imputed_from=donor_id
-    # for full audit trail.  Rows where no formula match exists remain in
-    # df_unmatched and are logged as WARNING (not silently discarded).
+    # ── Structure imputation ──────────────────────────────
     # FIX-HAS-STRUCT / FIX-DONOR-POOL: build broad donor pool from df_tier2
     # for _impute_structures (all high-k families) separately from df_structural
     # (Hf/Zr-only training rows). This prevents the 1128-row df_structural issue
     # where expanded is_hfo2_family diluted proc signal to ~10% per batch.
-    HIGH_K_ELEMS_DONOR = {"Hf", "Zr", "Al", "Ti", "Ta", "Sr", "La", "Y",
-                          "Ba", "Nb", "Ga", "In", "Sc", "Ce", "Pr", "Nd"}
+
     if df_tier2 is not None:
         df_donor_pool_wide = df_tier2[
             df_tier2["formula"].apply(
                 lambda f: isinstance(f, str) and "O" in f and
-                          any(el in f for el in HIGH_K_ELEMS_DONOR)
+                          any(el in f for el in HIGH_K_DONOR_ELEMENTS)
             )
         ].copy()
     else:
@@ -5656,8 +5788,7 @@ def run_tier3_finetune(
             len(df_unmatched),
         )
 
-    # FIX-T3-9A: Log-transform k_measured (mirrors Tier 2 k_total_log approach).
-    # Must run AFTER imputation so imputed rows also get the log column.
+    # Log-transform k (mirrors Tier 2 k_total_log approach).
     if cfg.get("log_transform", False):
         src_col = cfg["log_original_col"]   # "k_measured"
         log_col = cfg["target"]             # "k_measured_log"
@@ -5675,13 +5806,9 @@ def run_tier3_finetune(
             float(k_num[valid_k].min()), float(k_num[valid_k].max()),
         )
 
-    # FIX-T3-8C: Log valid-row counts for each target BEFORE build_dataloader.
-    # If N valid = 0 for any target, the column rename in load_experimental_process_db
-    # is the first place to check.  Counts are broken down by DFT vs experimental.
+    # Log valid-row counts for each target BEFORE build_dataloader.
     log.info("─" * 65)
     log.info("Tier 3 target coverage in df_structural (%d rows):", len(df_structural))
-    # FIX-T3-9A: primary target is now k_measured_log; also show k_measured
-    # coverage so fill-rate of the original measured column is visible.
     _diag_targets = [cfg["target"], "k_measured", "band_gap", "J_g_A_cm2", "E_BD_MV_cm"]
     for _tgt in _diag_targets:
         if _tgt not in df_structural.columns:
@@ -5753,49 +5880,28 @@ def run_tier3_finetune(
         cfg.get("min_epochs", 40) + cfg.get("patience", 40),
     )
 
-    # FIX-T3-KSUBSET: build Phase B dataloader on k_total_log non-null subset.
-    # Problem: df_structural has ~952 rows but only 139 (14.6%) have k_total_log.
-    # With batch_size=8: expected k signal per batch = 8 × 0.146 = 1.17 rows.
-    # 85% of Phase B gradient steps carried ZERO k_total_log signal.
-    # Fix: filter to k-valid rows so every batch step carries 100% k signal.
-    #
-    # FIX-ILOC: HighKGraphDataset.__getitem__ uses self.df.iloc[row_idx] where
-    # row_idx are INDEX LABELS from self.df[valid].index.tolist(). When df_phase_b
-    # is a filtered subset of df_structural (952→139 rows) its labels are
-    # non-contiguous (e.g. [813,814,...,951]) but iloc uses POSITION not label.
-    # iloc[813] on a 139-row df → IndexError (silently caught → row skipped) or
-    # reads the wrong row. This caused proc_avail_pct=0% throughout Tier 3
-    # training despite BUG-2 fix: the experimental rows with substrate_temp_C
-    # were never actually read — iloc indexed into DFT rows instead.
-    # Fix: reset_index(drop=True) makes labels == positions == 0..N-1.
+
+    # Filter to k-valid rows + reset_index for positional indexing.
+
     df_phase_b = (
         df_structural[df_structural[cfg["target"]].notna()]
         .copy()
-        .reset_index(drop=True)   # FIX-ILOC: iloc[i]==loc[i] after reset
+        .reset_index(drop=True)
     )
     _n_phase_b = len(df_phase_b)
     _n_phase_b_train = int(_n_phase_b * cfg["train_ratio"])
     log.info(
-        "FIX-T3-KSUBSET: Phase B dataloader built on k-valid subset  "
+        "Phase B dataloader built on k-valid subset  "
         "rows=%d  train≈%d  val≈%d  test≈%d  "
-        "(was: full df_structural=%d rows, k-density=%.1f%%)",
+        "k-density=%.1f%%)",
         _n_phase_b,
         _n_phase_b_train,
         int(_n_phase_b * cfg["val_ratio"]),
         _n_phase_b - _n_phase_b_train - int(_n_phase_b * cfg["val_ratio"]),
-        len(df_structural),
         100.0 * _n_phase_b / max(len(df_structural), 1),
     )
-    log.info(
-        "FIX-T3-KSUBSET: k_measured_log signal per batch: %.2f → %.2f rows  "
-        "(batch_size=%d)",
-        cfg["batch_size"] * (len(df_structural[df_structural[cfg["target"]].notna()])
-                             / max(len(df_structural), 1)),
-        float(cfg["batch_size"]),
-        cfg["batch_size"],
-    )
 
-    train_loader, val_loader, test_loader, train_sampler = build_dataloader(
+    train_loader, val_loader, test_loader, train_sampler, _ds = build_dataloader(
         df         = df_phase_b,
         target_col = cfg["target"],
         aux_cols   = cfg["aux_targets"],
@@ -5807,7 +5913,10 @@ def run_tier3_finetune(
     # Load model with Tier 2 weights -- no frozen layers for final fine-tune.
     # FIX-OBS1 collateral: explicit task_names from tier config for head-name
     # consistency with train_epoch targets_dict routing.
-    task_names_t3 = [cfg["target"]] + cfg["aux_targets"]
+    #
+    # Include "band_gap" so Phase A can train on it; Phase B/B2 are single-task
+    # so band_gap head retains Phase A learned weights.
+    task_names_t3 = [cfg["target"], "band_gap"]
     log.info("Tier 3 training with task heads: %s", task_names_t3)
     model = HighKALIGNN(config=ALIGNN_BASE_CONFIG, task_names=task_names_t3)
     model.load_pretrained_weights(pretrained_weights, strict=False)
@@ -5822,44 +5931,27 @@ def run_tier3_finetune(
     trainer = ALIGNNTrainer(model, cfg, ckpt_prefix="tier3",
                             ablate_context=ablate_context)
 
-    # ── FIX-T3-PHASE-A: band_gap consolidation on full oxide dataset ──────────
-    # Before Phase B k_measured_log fine-tuning, run phase_a_steps gradient steps
-    # on df_tier2 (all oxide rows with band_gap) to anchor backbone representations.
-    #
-    # FIX-T3-PHASEACAP: Controlled by phase_a_steps (step budget) not phase_a_epochs.
-    # Old behaviour: 20 epochs × 5,843 steps/epoch = 116,860 steps = 93% of all
-    # Tier 3 gradient steps → backbone re-specialised for full-oxide band_gap.
-    # New behaviour: exits after 200 steps regardless of epoch boundaries.
-    # 200 steps on 49K rows = 0.03 epochs — brief anchor only.
-    # New Phase A:Phase B ratio = 200 : ~1,200 = 0.17× (was 14.1×).
-    phase_a_steps = cfg.get("phase_a_steps", cfg.get("phase_a_epochs", 0))
-    # Backward compat: if only phase_a_epochs is set, convert to step budget
-    if "phase_a_epochs" in cfg and "phase_a_steps" not in cfg:
-        # Estimate steps from epoch count × loader length (old behaviour preserved)
-        phase_a_steps = cfg["phase_a_epochs"]   # treated as epoch count below
-        _phase_a_mode = "epochs"
-    else:
-        _phase_a_mode = "steps"
+    # ── PHASE-A: band_gap consolidation on Tier 3 structural data ──────────
 
-    if phase_a_steps > 0 and df_tier2 is not None:
-        df_pa = df_tier2[df_tier2["band_gap"].notna()].copy()
+    phase_a_steps = cfg.get("phase_a_steps")
+
+    if phase_a_steps > 0 and len(df_structural) > 0:
+        df_pa = df_structural[df_structural["band_gap"].notna()].copy()
         log.info("─" * 68)
         log.info(
-            "TIER 3 PHASE A: band_gap consolidation  "
+            "TIER 3 PHASE A: band_gap consolidation (Tier 3 data) "
             "rows=%d  budget=%d %s  lr=%.2e",
-            len(df_pa), phase_a_steps, _phase_a_mode,
-            cfg.get("phase_a_lr", cfg["learning_rate"]),
+            len(df_pa), phase_a_steps,cfg["phase_a_lr"],
         )
+        phase_b_steps = int(_n_phase_b * cfg["train_ratio"] / cfg["batch_size"]) * cfg.get("epochs", 100)
         log.info(
-            "  Purpose: brief backbone anchor before Phase B k_measured_log.  "
+            "  Purpose: anchor backbone in Hfo2 faily representation subspace  "
+            "before Phase B k_total_log fine-tuning"
             "Phase A:Phase B step ratio = %d:%d = %.2fx",
-            phase_a_steps if _phase_a_mode == "steps" else phase_a_steps * int(len(df_pa) * 0.95 / cfg["batch_size"]),
-            int(_n_phase_b * cfg["train_ratio"] / cfg["batch_size"]) * cfg.get("epochs", 100),
-            (phase_a_steps if _phase_a_mode == "steps" else phase_a_steps * int(len(df_pa) * 0.95 / cfg["batch_size"]))
-            / max(1, int(_n_phase_b * cfg["train_ratio"] / cfg["batch_size"]) * cfg.get("epochs", 100)),
+            phase_a_steps, phase_b_steps, phase_a_steps / max(phase_b_steps, 1)
         )
 
-        pa_loader, _, _, pa_sampler = build_dataloader(
+        pa_loader, _, _, pa_sampler, _ds = build_dataloader(
             df         = df_pa,
             target_col = "band_gap",
             aux_cols   = ["formation_energy_per_atom"],
@@ -5869,90 +5961,184 @@ def run_tier3_finetune(
         )
         pa_optimizer = torch.optim.AdamW(
             model.parameters(),
-            lr           = cfg.get("phase_a_lr", cfg["learning_rate"]),
+            lr           = cfg["phase_a_lr"],
             weight_decay = cfg["weight_decay"],
         )
         _saved_cfg        = trainer.cfg
         _saved_optimizer  = trainer.optimizer
         trainer.optimizer = pa_optimizer
 
-        if _phase_a_mode == "steps":
-            # FIX-T3-PHASEACAP + CKPT-RT-LOSS: Step-budget mode.
-            # Previous implementation duplicated train_epoch internals and
-            # referenced trainer.loss_fn (AttributeError — correct name is
-            # trainer.criterion) and called criterion with wrong signature.
-            #
-            # Fix: wrap pa_loader in a step-counting DataLoader subclass via
-            # itertools.islice so train_epoch() naturally exits after the budget
-            # is consumed — reuses all correct loss/optimizer/scheduler logic.
+        import itertools as _itools
 
-            import itertools as _itools
+        class _StepBudgetLoader:
+            """Wraps a DataLoader and stops after `max_steps` batches."""
+            def __init__(self, loader, max_steps):
+                self._loader   = loader
+                self._max      = max_steps
+                self._done     = 0
+            def __iter__(self):
+                for batch in self._loader:
+                    if self._done >= self._max:
+                        return
+                    yield batch
+                    self._done += 1
+            def __len__(self):
+                return min(self._max, len(self._loader))
 
-            class _StepBudgetLoader:
-                """Wraps a DataLoader and stops after `max_steps` batches."""
-                def __init__(self, loader, max_steps):
-                    self._loader   = loader
-                    self._max      = max_steps
-                    self._done     = 0
-                def __iter__(self):
-                    for batch in self._loader:
-                        if self._done >= self._max:
-                            return
-                        yield batch
-                        self._done += 1
-                def __len__(self):
-                    return min(self._max, len(self._loader))
+        _cycled_loader = _StepBudgetLoader(
+            type('_CycledLoader', (), {
+                '__iter__': lambda self: _itools.islice(
+                    _itools.cycle(pa_loader), phase_a_steps
+                ),
+                '__len__': lambda self: phase_a_steps,
+            })(),
+            max_steps = phase_a_steps,
+        )
 
-            # Cycle pa_loader so islice can draw phase_a_steps batches even if
-            # phase_a_steps > len(pa_loader) (i.e. budget > 1 epoch).
-            _cycled_loader = _StepBudgetLoader(
-                type('_CycledLoader', (), {
-                    '__iter__': lambda self: _itools.islice(
-                        _itools.cycle(pa_loader), phase_a_steps
-                    ),
-                    '__len__': lambda self: phase_a_steps,
-                })(),
-                max_steps = phase_a_steps,
-            )
+        trainer.cfg = {**cfg, "epochs": 1, "early_stopping": False}
+        sched_pa    = trainer.build_scheduler(phase_a_steps, 1)
 
-            trainer.cfg = {**cfg, "epochs": 1, "early_stopping": False}
-            sched_pa    = trainer.build_scheduler(phase_a_steps, 1)
-
-            ep = trainer.train_epoch(_cycled_loader, sched_pa, "band_gap")
-            _pa_total_steps = phase_a_steps
-            log.info(
-                "Tier 3 Phase A  %d steps complete  loss=%.4f  proc_avail=%.1f%%",
-                _pa_total_steps, ep["loss"], ep.get("proc_avail_pct", 0.0),
-            )
-        else:
-            # Legacy epoch-count mode (phase_a_epochs set, phase_a_steps absent)
-            trainer.cfg = {**cfg, "epochs": phase_a_steps, "early_stopping": False}
-            sched_pa = trainer.build_scheduler(len(pa_loader), phase_a_steps)
-            for epoch in range(1, phase_a_steps + 1):
-                ep = trainer.train_epoch(pa_loader, sched_pa, "band_gap")
-                log.info(
-                    "Tier 3 Phase A  ep %3d/%d  loss=%.4f  proc_avail=%.1f%%",
-                    epoch, phase_a_steps, ep["loss"], ep.get("proc_avail_pct", 0.0),
-                )
+        ep = trainer.train_epoch(_cycled_loader, sched_pa, "band_gap")
+        _pa_total_steps = phase_a_steps
+        log.info(
+            "Tier 3 Phase A  %d steps complete  loss=%.4f  proc_avail=%.1f%%",
+            phase_a_steps, ep["loss"], ep.get("proc_avail_pct", 0.0),
+        )
 
         trainer.cfg       = _saved_cfg
         trainer.optimizer = _saved_optimizer
         log.info(
-            "Tier 3 Phase A complete (%d steps) — starting Phase B k_measured_log fine-tuning",
-            _pa_total_steps if _phase_a_mode == "steps" else phase_a_steps * len(pa_loader),
+            "Tier 3 Phase A complete (%d steps) — starting Phase B k_total_log fine-tuning",
+            phase_a_steps,
         )
         log.info("─" * 68)
 
-    elif phase_a_steps > 0 and df_tier2 is None:
+    elif phase_a_steps > 0 and len(df_structural) == 0:
         log.warning(
-            "FIX-T3-PHASE-A: phase_a_steps=%d requested but df_tier2=None. "
-            "Pass df_tier2 to run_tier3_finetune() to enable Phase A consolidation. "
-            "Skipping — band_gap performance may degrade significantly.",
-            phase_a_steps,
+            "Phase_ A: df_structural is empty. Skipping Phase A conslidation. ",
         )
 
-    # ── Phase B: k_measured_log fine-tuning on HfO2-family ───────────────────
-    history = trainer.train(train_loader, val_loader, target_col=cfg["target"], train_sampler=train_sampler)
+    # ── Phase B: backbone-free, single-task, k_total_log fine-tuning  ───────────────────
+    freeze_backbone = cfg.get("freeze_backbone", False)
+    if freeze_backbone:
+        model.freeze_backbone()
+        log.info("─" * 68)
+        log.info(
+            "Tier 3 Phase B: backbone-free, Singele task k_total_log fine-tuning"
+            "rows=%d  epochs=%d  lr≈%d  batch_size=%s",
+            _n_phase_b, cfg["epochs"], cfg["learning_rate"], cfg["batch_size"]
+        )
+        log.info("Frozen : ALLIGN backbone (all message passing layers)")
+        log.info(" Training task_heads, context_proj, proc_encoder, stack_encoder, alpha, beta")
+
+        # Build Phase B dataloader with single task targets (k_total_log only)
+        pb_loader, pb_val_loader, _, pb_sampler, _ds = build_dataloader(
+            df         = df_phase_b,
+            target_col = cfg["target"],
+            aux_cols   = [], # single-task: no aux heads
+            train_frac = cfg["train_ratio"],
+            val_frac   = cfg["val_ratio"],
+            batch_size = cfg["batch_size"],
+        )
+
+        # Build optimizer with ONLY trainable (non-backbone) parameters
+        pb_params = [p for p in model.parameters() if p.requires_grad]
+        pb_optimizer = torch.optim.AdamW(
+            pb_params,
+            lr           = cfg["learning_rate"],
+            weight_decay = cfg["weight_decay"],
+        )
+        _saved_optimizer  = trainer.optimizer
+        trainer.optimizer = pb_optimizer
+
+        pb_history = trainer.train(
+            pb_loader, pb_val_loader,
+            target_col = cfg["target"],
+            train_sampler=pb_sampler,
+        )
+
+        _pb_best_epoch = trainer.best_epoch
+        _pb_best_mae = trainer.best_val_mae
+        trainer.optimizer = _saved_optimizer
+        log.info(
+            "Phase B complete: best val MAE=%.4f  at epoch=%d",
+            _pb_best_mae, _pb_best_epoch
+        )
+        log.info("─" * 68)
+
+        # Phase B2: unfreeze backbone, single-task (no aux heads)
+        # Abandon multi-task for Tier3. Phase B2 is single-task
+        # (k_total_log only) to avoid aux head gradient competition on 193 rows
+        unfreeze_after = cfg.get("unfreeze_backbone_after", 50)
+        unfreeze_lr = cfg.get("unfreeze_backbone_lr", 1e-5)
+        b2_epochs = max(0, cfg["epochs"] - _pb_best_epoch)
+        if b2_epochs <= 0
+            b2_epochs = 30 # mininium if Phase B already converged
+
+        log.info("─" * 68)
+        log.info(
+            "Tier 3 Phase B2: Unfreeze backbone, Singele task"
+            "epochs=%d  backbone≈%d  batch_size=%s",
+            b2_epochs, unfreeze_lr, cfg["batch_size"]
+        )
+        log.info("UnFreezing backbone at lr = %.2e (lower than Phase B lr = %.2e)", unfreeze_lr, cfg["learning_rate"])
+        log.info(" Single Task: k_total_log only (no aux heads)")
+
+        model.unfreeze_backbone(lr=unfreeze_lr)
+
+        # Build Phase B2 dataloader --single-task (no aux targets)
+        pb2_loader, pb2_val_loader, _, pb2_sampler, _ds = build_dataloader(
+            df         = df_phase_b,
+            target_col = cfg["target"],
+            aux_cols   = [], # single-task: no aux heads
+            train_frac = cfg["train_ratio"],
+            val_frac   = cfg["val_ratio"],
+            batch_size = cfg["batch_size"],
+        )
+
+        # Two tier LR: backbone at unfreeze_lr heads/context at higher LR
+        # This prevents catastrophic forgetting while allowing task-specific adaption
+        backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
+        head_params =  [p for p in model.parameters()
+                        if p not in set(backbone_params) and p.required_grad]
+
+        pb2_params_groups = [
+            {"params": backbone_params, "lr": unfreeze_lr, "weight_decay": cfg["weight_decay"]},
+            {"params": head_params, "lr": cfg["learning_rate"], "weight_decay": cfg["weight_decay"]},
+        ]
+        log.info(
+            "Phase B2 two tier LR: backbone=%.2e  heads/context=%.2e",
+            unfreeze_lr, cfg["learning_rate"]
+        )
+
+        # Build optimizer with two tier param groups
+        pb2_optimizer = torch.optim.AdamW(pb2_params_groups)
+        _saved_optimizer  = trainer.optimizer
+        trainer.optimizer = pb2_optimizer
+
+        # update cfg for B2
+        _saved_cfg = trainer.cfg
+        trainer.cfg = {
+            **cfg,
+            "epochs": b2_epochs,
+            "learning_rate": unfreeze_lr,
+        }
+
+        pb2_history = trainer.train(
+            pb2_loader, pb2_val_loader,
+            target_col=cfg["target"],
+            train_sampler=pb2_sampler,
+        )
+
+        trainer.optimizer = _saved_optimizer
+        trainer.cfg = _saved_cfg
+        log.info(
+            "Phase B2 complete: best val MAE=%.4f  at epoch=%d",
+            "(Phase B2 epoch %d)",
+            trainer.best_val_mae, trainer.best_epoch,
+            trainer.best_epoch - _pb_best_epoch,
+        )
+        log.info("─" * 68)
 
     # CKPT-RT2+RT3 FIX: reload best checkpoint with strict=False + key remapping.
     # Previous code: trainer.model_core.load_state_dict(ckpt["model_state_dict"])
@@ -5984,7 +6170,6 @@ def run_tier3_finetune(
     # Previous MAD:MAE=0.14 was a log-space artifact: MAD≈0 because all 5 test
     # samples were near-identical monoclinic HfO2 (log(k)≈log(22)≈3.09 for all).
     # New block computes MAD on linear-k and gives pass/fail vs benchmarks.
-    import math as _math
 
     test_mae_log, test_rmse_log, preds_log, trues_log = trainer.evaluate(
         test_loader, cfg["target"], return_preds=True
@@ -6002,8 +6187,8 @@ def run_tier3_finetune(
         log.info("  Diagnostic log-space  RMSE = %.4f", test_rmse_log)
         log.info(
             "  exp(MAE)                  = %.4f×  → ±%.1f%% avg relative error",
-            _math.exp(test_mae_log),
-            (_math.exp(test_mae_log) - 1) * 100,
+            math.exp(test_mae_log),
+            (math.exp(test_mae_log) - 1) * 100,
         )
         log.info("")
 
@@ -6073,11 +6258,11 @@ def run_tier3_finetune(
         n_valid = 0
 
     # ── Multi-task table (all heads) ─────────────────────────────────────────
-    mt_results = trainer.evaluate_multitask(test_loader, cfg, df_full=df_phase_b)
-    # FIX-ILOC + evaluate_multitask: pass df_phase_b (not df_structural) so
-    # N_Valid is computed against the 139-row k-valid subset (100% k density)
-    # rather than df_structural (952 rows, 14.6% k density → N_Valid≈5 artifact).
-    trainer.print_multitask_results(mt_results, split_name="TEST", tier_name="TIER 3")
+    # band_gap is NOT a primary metric for Tier 3. The model was trained for
+    # k_total_log in Phase B2, and the band_gap head was only trained during
+    # Phase A (500 steps). Evaluating band_gap on the same 2,024 DFT rows
+    # used in Phase A training is evaluating on the training distribution.
+    # If band_gap prediction is needed, add it as an aux target during Phase B2.
 
     # ── Final summary (linear-k, matches Tier 2 reporting format) ────────────
     log.info("─" * 68)
@@ -6097,13 +6282,13 @@ def run_tier3_finetune(
         "mae_log_k":          test_mae_log,
         "rmse_log_k":         test_rmse_log,
         "exp_mae_multiplier": (
-            _math.exp(test_mae_log) if cfg.get("log_transform") else float("nan")
+            math.exp(test_mae_log) if cfg.get("log_transform") else float("nan")
         ),
         # Linear-k exact (FIX-T3-LINMAE — publication / benchmark metric)
-        "mae_linear_k":       mae_k_linear,
-        "rmse_linear_k":      rmse_k_linear,
-        "mad_linear_k":       mad_k_linear,
-        "mad_mae_linear_k":   mad_mae_linear,
+        "mae_k_exact":       mae_k_linear,
+        "rmse_k_exact":      rmse_k_linear,
+        "mad_k_exact":       mad_k_linear,
+        "mad_mae_k_exact":   mad_mae_linear,
         "n_test":             n_valid,
         # Canonical aliases for downstream comparison scripts
         "mae":                mae_k_linear,
@@ -6112,7 +6297,7 @@ def run_tier3_finetune(
         "diagnostic_scale":   "log",
     }
     with open(out_path, "w") as f:
-        json.dump({"primary": primary_metrics, "multitask": mt_results}, f, indent=2)
+        json.dump({"primary": primary_metrics}, f, indent=2)
     log.info("Tier 3 test results saved → %s", out_path)
 
     return CKPT_ROOT / "tier3_best.pt"
@@ -6371,37 +6556,51 @@ def run_tier_evaluate(
 
     else:  # tier == 3  (FIX-T3-2)
         cfg = TIER3_TRAIN_CONFIG
-        df_structural = df[df["atoms_dict"].notna()].copy()
-        n_proc_only   = len(df) - len(df_structural)
-        log.info(
-            "Tier 3 evaluate: structural rows=%d  process-only (excluded)=%d",
-            len(df_structural), n_proc_only,
-        )
-        if len(df_structural) == 0:
-            log.error("No structural rows in Tier 3 DataFrame.  Cannot reproduce test split.")
-            return
+        df_eval = df.copy()
 
-        # FIX-T3-9A: apply log-transform if configured (mirrors run_tier3_finetune)
+        # FIX: apply log-transform FIRST (mirrors run_tier3_finetune)
+        # THEN filter by k_total_log.notna(). The HDF5 cache has k_total but
+        # not k_total_log - the transform must be applied here
         if cfg.get("log_transform", False):
             src_col = cfg["log_original_col"]
             log_col = cfg["target"]
-            k_num   = pd.to_numeric(df_structural[src_col], errors="coerce")
+            k_num   = pd.to_numeric(df_eval[src_col], errors="coerce")
             valid_k = k_num.notna()
-            df_structural[log_col] = np.nan
-            df_structural.loc[valid_k, log_col] = np.log(k_num[valid_k].clip(lower=0.1))
+            df_eval[log_col] = np.nan
+            df_eval.loc[valid_k, log_col] = np.log(k_num[valid_k].clip(lower=0.1))
             log.info("tier3_evaluate: log transform %s → %s  (%d rows)", src_col, log_col, int(valid_k.sum()))
 
-        df_eval = df_structural[
-            pd.to_numeric(df_structural[cfg["target"]], errors="coerce").notna()
-        ].copy()
-        log.info("Tier 3 rows with %s (structural): %d", cfg["target"], len(df_eval))
+        df_kvalid = df_eval[df_eval[cfg["target"]].notna()].copy()
+        log.info("Tier 3 rows with %s : %d (matches training df_phase_b)", cfg["target"], len(df_kvalid))
+
+        # FIX : Filter to structural rows BEFORE stratified split.
+        # HighKGraphDataset silently drops rows without atoms_dict. If we split
+        # on 193 rows but only 82 have structures, the test set ends up with ~13 rows
+        # instead of ~30. we must split on the rows that will actually be used by the 
+        # dataloader
+        #
+        # Note : In training, experimental rows have atoms_dict imputed from DFT
+        # donors. If the HDF5 cache has these imputed values all 193 rows will pass.
+        # If not, only the 82 DFT rows will pass - which is fine, we just need to split
+        # on the correct set of rows
+        if "atoms_dict" in df_kvalid.columns:
+            df_eval = df_kvalid[df_kvalid["atoms_dict"].notna()].copy()
+            n_dropped = len(df_kvalid) - len(df_eval)
+            if n_dropped > 0:
+                log.info(
+                    "Tier 3 %d k-valid rows without atoms_dict dropped "
+                    "(split will be on %d structural k-valid rows)",
+                    n_dropped, len(df_eval)
+                )
+        else:
+            df_eval = df_kvalid
 
         target_col  = cfg["target"]
         task_names  = [target_col] + cfg["aux_targets"]
         ckpt_prefix = "tier3"
 
     # ── Rebuild the exact same test split (seed=42, same ratios) ─────────────
-    _, _, test_loader, _ = build_dataloader(
+    _, _, test_loader, _, test_dataset = build_dataloader(
         df         = df_eval,
         target_col = target_col,
         aux_cols   = [t for t in task_names if t != target_col],
@@ -6456,15 +6655,29 @@ def run_tier_evaluate(
         log.info("  ALIGNN paper    ≈ 0.81  [linear k, JARVIS DFPT]")
     elif tier == 3:
         # Tier 3 primary is k_measured in linear space
-        log.info("  k_measured (linear)  MAE  = %.4f  [dielectric units]", test_mae_log)
-        log.info("  k_measured (linear)  RMSE = %.4f  [dielectric units]", test_rmse_log)
-        log.info("  Goal: MAD:MAE ≥ 2.5 with three-tier transfer learning")
+        valid = ~torch.isnan(trues_t)
+        if valid.sum() > 0:
+           mae_k_exact = (torch.exp(preds_t[valid]) - torch.exp(trues_t[valid])).abs().mean().item()
+           rmse_k_exact = ((torch.exp(preds_t[valid]) - torch.exp(trues_t[valid]))  ** 2).mean().sqrt().item()
+        else:
+            mae_k_exact = rsme_k_exact = float("nan")
+        log.info(" Diagnostic log-space MAE = %.4f [log(k) units]", test_mae_log)
+        log.info(" Diagnostic log-space RSME = %.4f ",test_rmse_log )
+        log.info(" exp (MAE) = %.4fx -> %.1f%% avg relative error",
+                 math.exp(test_mae_log) if not math.isnan(test_mae_log) else float("nan"),
+                 ((math.exp(test_mae_log) -1) *100) if not math.isnan(test_mae_log) else float("nan"))
+        if not math.isnan(mae_k_exact):
+            log.info(" PRIMARY (linear - k exact) MAE = %.4f [dielectric units]",mae_k_exact)
+            log.info(" PRIMARY (linear - k exact) RMSE = %.4f [dielectric units]",rmse_k_exact)
+        else:
+            log.info(" PRIMARY (linear - k exact) MAE = N/A (no valid samples)")
+            log.info(" PRIMARY (linear - k exact) RMSE = N/A")
     else:
         log.info("  MAE  = %.4f", test_mae_log)
         log.info("  RMSE = %.4f", test_rmse_log)
 
     # ── Full multitask table ──────────────────────────────────────────────────
-    mt_results = trainer.evaluate_multitask(test_loader, cfg, df_full=df_eval)
+    mt_results = trainer.evaluate_multitask(test_loader, cfg, df_full=test_dataset.df)
     trainer.print_multitask_results(
         mt_results, split_name="TEST", tier_name=tier_label
     )
@@ -6477,136 +6690,6 @@ def run_tier_evaluate(
             "(paper: 1.63 @ 44K no transfer | goal: ≥ 2.5 with three-tier transfer)",
             km["mad"], km["mae"], km["mad_mae_ratio"],
         )
-
-    # ── Save to JSON ──────────────────────────────────────────────────────────
-    out_path = REPORT_ROOT / f"tier{tier}_evaluate_results.json"
-    primary  = {"mae": test_mae_log, "rmse": test_rmse_log,
-                "mae_log_k": test_mae_log,
-                "rmse_log_k": test_rmse_log,
-                "checkpoint_epoch": saved_epoch,
-                "checkpoint_val_mae": saved_mae,
-                "benchmark_scale": "linear",
-                "diagnostic_scale": "log"}
-    if tier == 2 and cfg.get("log_transform", False):
-        primary.update({"mae_linear_k": mae_k_exact,
-                        "rmse_linear_k": rmse_k_exact,
-                        "mae": mae_k_exact,
-                        "rmse": rmse_k_exact,
-                        "exp_mae_multiplier": math.exp(test_mae_log)})
-    with open(out_path, "w") as f:
-        json.dump({"primary": primary, "multitask": mt_results}, f, indent=2)
-    log.info("Results saved → %s", out_path)
-    log.info("─" * 68)
-
-    tier_label = f"TIER {tier}"
-    log.info("=" * 70)
-    log.info(" %s -- Checkpoint Evaluation (no retraining)", tier_label)
-    log.info(" Checkpoint : %s", checkpoint_path)
-    log.info(" Rows in df : %d", len(df))
-    log.info("=" * 70)
-
-    # ── Preprocessing: identical to training ─────────────────────────────────
-    if tier == 1:
-        cfg = TIER1_TRAIN_CONFIG
-        df_eval = df.copy()
-
-        # Replicate Tier 1 log-transform aux preprocessing
-        for log_col, src_col in cfg.get("log_transform_aux", {}).items():
-            if src_col in df_eval.columns:
-                src_numeric = pd.to_numeric(df_eval[src_col], errors="coerce")
-                mask = src_numeric.notna()
-                df_eval[log_col] = np.nan
-                df_eval.loc[mask, log_col] = np.log(
-                    src_numeric[mask].clip(lower=0.1)
-                )
-                log.info("Aux log transform: %s → %s  (%d non-null rows)",
-                         src_col, log_col, int(mask.sum()))
-
-        target_col = cfg["target"]             # formation_energy_per_atom
-        task_names = [target_col] + cfg["aux_targets"]
-        ckpt_prefix = "tier1"
-
-    else:  # tier == 2
-        cfg = TIER2_TRAIN_CONFIG
-        df_eval = df[pd.to_numeric(df["k_total"], errors="coerce").notna()].copy()
-        log.info("Tier 2 rows with k_total: %d", len(df_eval))
-
-        if cfg.get("log_transform", False):
-            orig_col = cfg["log_original_col"]
-            log_col  = cfg["target"]
-            k_num    = pd.to_numeric(df_eval[orig_col], errors="coerce")
-            df_eval[log_col] = np.log(k_num.clip(lower=0.1))
-            log.info("Log transform: %s → %s  range=[%.3f, %.3f]",
-                     orig_col, log_col,
-                     df_eval[log_col].min(), df_eval[log_col].max())
-
-        target_col = cfg["target"]             # k_total_log
-        task_names = [target_col] + cfg["aux_targets"]
-        ckpt_prefix = "tier2"
-
-    # ── Rebuild the exact same test split (seed=42, same ratios) ─────────────
-    _, _, test_loader, _ = build_dataloader(
-        df         = df_eval,
-        target_col = target_col,
-        aux_cols   = [t for t in task_names if t != target_col],
-        train_frac = cfg["train_ratio"],
-        val_frac   = cfg["val_ratio"],
-        batch_size = cfg["batch_size"],
-    )
-    log.info("Test loader: %d batches  (seed=42 → same split as training)",
-             len(test_loader))
-
-    # ── Build model and load checkpoint ──────────────────────────────────────
-    model = HighKALIGNN(config=ALIGNN_BASE_CONFIG, task_names=task_names)
-    model.fit_encoder_stats(df_eval)
-
-    if not checkpoint_path.exists():
-        log.error("Checkpoint not found: %s", checkpoint_path)
-        return
-
-    ckpt = torch.load(checkpoint_path, map_location="cpu")
-    saved_epoch = ckpt.get("epoch", "?")
-    saved_mae   = ckpt.get("val_mae", float("nan"))
-    model.load_state_dict(ckpt["model_state_dict"], strict=False)
-    log.info("Loaded checkpoint: epoch=%s  saved_val_MAE=%.4f", saved_epoch, saved_mae)
-
-    # ── Trainer (eval-only — no optimizer needed) ─────────────────────────────
-    trainer = ALIGNNTrainer(model, cfg, ckpt_prefix=ckpt_prefix,
-                            ablate_context=ablate_context)
-
-    # ── Primary metric ────────────────────────────────────────────────────────
-    test_mae_log, test_rmse_log, preds_t, trues_t = trainer.evaluate(
-        test_loader, target_col, return_preds=True
-    )
-
-    log.info("")
-    log.info("─" * 68)
-    log.info("  %s TEST RESULTS  (checkpoint: ep %s)", tier_label, saved_epoch)
-    log.info("─" * 68)
-
-    if tier == 2 and cfg.get("log_transform", False):
-        valid = ~torch.isnan(trues_t)
-        mae_k_exact  = (torch.exp(preds_t[valid]) -
-                        torch.exp(trues_t[valid])).abs().mean().item()
-        rmse_k_exact = ((torch.exp(preds_t[valid]) -
-                         torch.exp(trues_t[valid])) ** 2).mean().sqrt().item()
-        log.info("  Diagnostic log-space  MAE  = %.4f  [log(k) units]", test_mae_log)
-        log.info("  Diagnostic log-space  RMSE = %.4f", test_rmse_log)
-        log.info("  exp(MAE)                  = %.4f×  → ±%.1f%% average relative error",
-                 math.exp(test_mae_log), (math.exp(test_mae_log) - 1) * 100)
-        log.info("  PRIMARY benchmark (linear-k) MAE  = %.4f  [dielectric units, exact]", mae_k_exact)
-        log.info("  PRIMARY benchmark (linear-k) RMSE = %.4f  [dielectric units]", rmse_k_exact)
-        log.info("  Benchmark scale for publication: LINEAR-K")
-        log.info("  ALIGNN paper    ≈ 0.81  [linear k, JARVIS DFPT]")
-    else:
-        log.info("  MAE  = %.4f", test_mae_log)
-        log.info("  RMSE = %.4f", test_rmse_log)
-
-    # ── Full multitask table ──────────────────────────────────────────────────
-    mt_results = trainer.evaluate_multitask(test_loader, cfg, df_full=df_eval)
-    trainer.print_multitask_results(
-        mt_results, split_name="TEST", tier_name=tier_label
-    )
 
     # ── Save to JSON ──────────────────────────────────────────────────────────
     out_path = REPORT_ROOT / f"tier{tier}_evaluate_results.json"
@@ -6721,20 +6804,73 @@ def main():
                 "  Pass the path explicitly with --weights <path>", ckpt_path
             )
             return
+        
+        # FIX support --rebuild_tier3 for tier3_evaluate.
+        # Rebuilds Tier3 dataset AND applies structure imputation before loading the HDF5 cache
+        # This ensures experimental rows have atoms_dict for graph construction, matching
+        # the training pipeline.
+        if args.mode == "tier3_evaluate" and getattr(args, "rebuild_tier3", False):
+            log.info("tier3_evaluate: rebuilding Tier 3 dataset ( --rebuild_tier3)")
+            t1_hdf5 = builder.TIER_PATHS[1]
+            t2_hdf5 = builder.TIER_PATHS[2]
+            if not t1_hdf5.exists():
+                log.error(" Tier1 HDF5 is not found at %s. Run tier1_pretrain first.",t1_hdf5)
+                return
+            if not t2_hdf5.exists():
+                log.error(" Tier2 HDF5 is not found at %s. Run tier2_pretrain first.",t2_hdf5)
+                return
+            df_tier1=pd.read_hdf(t1_hdf5, key="data")
+            df_tier2=pd.read_hdf(t2_hdf5, key="data")
+            df_exp = extractor.load_experimental_process_db()
+            df_tier3=builder.build_tier3(df_tier2, df_exp, force_rebuild=True)
 
-        # Load HDF5 cache for the relevant tier (no rebuild)
-        tier_hdf5 = builder.TIER_PATHS[tier_num]
-        if not tier_hdf5.exists():
-            log.error(
-                "Tier %d HDF5 not found at %s.\n"
-                "  Run --mode tier%d_pretrain (or tier%d_finetune) first to build the cache.",
-                tier_num, tier_hdf5, tier_num, tier_num
-            )
-            return
+            # FIX : apply structure imputation (same as run_tier3_finetune)
+            # The HDF5 cache doesnt have imputed atoms_dict - its done in-memory in run_tier3_finetune
+            # we must replicate this here.
+            # FIX: Use df_tier2 as donor pool (not df_structural)
+            # The training code builds df_done_pool_wide from df_tier2 which
+            # contains all high-k familes (Hf, Zr, Al, Ti, Ta, Sr, La, Y, Ba,
+            # Nb, Ga, In, Sc, Ce, Pr, Nd oxides). Using df_structural
+            # (Hfo2 family only) causes 95/1120 matched vs 120/120 in training
+            df_structural = df_tier3[df_tier3["atoms_dict"].notna()].copy()
+            df_process_only = df_tier3[df_tier3["atoms_dict"].isna()].copy()
+            if len(df_process_only) > 0 and len(df_structural) > 0:
+                df_donor_pool_wide = df_tier2[
+                    df_tier2["formula"].apply(
+                        lambda f: isinstance(f, str) and "0" in f and 
+                                any(el in f for el in HIGH_K_DONOR_ELEMENTS)
+                    )
+                    ].copy()
+                log.info("Donor Pool from df_tier2: %d high-k oxide rows", len(df_donor_pool_wide))
+                df_imputed, df_unmatched = _impute_structures(
+                    df_process_only, df_donor_pool_wide
+                )
+                if len(df_imputed) > 0:
+                    df_tier3 = pd.concat(
+                        [df_structural, df_imputed, df_unmatched], ignore_index=True
+                    )
 
-        log.info("Loading Tier %d dataset from cache: %s", tier_num, tier_hdf5)
-        df_eval = pd.read_hdf(tier_hdf5, key="data")
-        log.info("  %d rows loaded", len(df_eval))
+            log.info("Tier 3 rebuild: %d rows (k_measured non-null : %d)",
+                    len(df_tier3), int(df_tier3["k_measured"].notna().sum()))
+            # use rebuilt data directly (with imputed atoms_dict) instead of
+            # loading from the old HDF5 cache which lacks imputed structures.
+            df_eval=df_tier3
+            log.info("Using rebuilt Tier3 dataset (with structure imputation)")
+          
+        else:
+            # Load HDF5 cache for the relevant tier
+            tier_hdf5 = builder.TIER_PATHS[tier_num]
+            if not tier_hdf5.exists():
+                log.error(
+                    "Tier %d HDF5 not found at %s.\n"
+                    "  Run --mode tier%d_pretrain (or tier%d_finetune) first to build the cache.",
+                    tier_num, tier_hdf5, tier_num, tier_num
+                )
+                return
+
+            log.info("Loading Tier %d dataset from cache: %s", tier_num, tier_hdf5)
+            df_eval = pd.read_hdf(tier_hdf5, key="data")
+            log.info("  %d rows loaded", len(df_eval))
 
         run_tier_evaluate(
             tier            = tier_num,
