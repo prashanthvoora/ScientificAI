@@ -4927,7 +4927,7 @@ class ALIGNNTrainer:
 # SECTION 8 -- FULL THREE-TIER PIPELINE  (was Section 7)
 # ==============================================================================
 
-class BalancedDistributedSampler(torch.utils.data.sampler):
+class BalancedDistributedSampler(torch.utils.data.Sampler):
     """
     Distributed Sampler that guraantees balances proc_avail (DFT vs experimental)
     across ranks every epoch via round-robin grouping.
@@ -4940,7 +4940,7 @@ class BalancedDistributedSampler(torch.utils.data.sampler):
             num_replicas: int = 2,
             rank: int =0,
             seed: int = 42,
-            shuffle: bool = True
+            shuffle: bool = True,
         ):
             self.dataset = dataset
             self.proc_avail = proc_avail
@@ -5999,7 +5999,6 @@ def run_tier3_finetune(
         sched_pa    = trainer.build_scheduler(phase_a_steps, 1)
 
         ep = trainer.train_epoch(_cycled_loader, sched_pa, "band_gap")
-        _pa_total_steps = phase_a_steps
         log.info(
             "Tier 3 Phase A  %d steps complete  loss=%.4f  proc_avail=%.1f%%",
             phase_a_steps, ep["loss"], ep.get("proc_avail_pct", 0.0),
@@ -6072,7 +6071,7 @@ def run_tier3_finetune(
         unfreeze_after = cfg.get("unfreeze_backbone_after", 50)
         unfreeze_lr = cfg.get("unfreeze_backbone_lr", 1e-5)
         b2_epochs = max(0, cfg["epochs"] - _pb_best_epoch)
-        if b2_epochs <= 0
+        if b2_epochs <= 0:
             b2_epochs = 30 # mininium if Phase B already converged
 
         log.info("─" * 68)
@@ -6100,9 +6099,9 @@ def run_tier3_finetune(
         # This prevents catastrophic forgetting while allowing task-specific adaption
         backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
         head_params =  [p for p in model.parameters()
-                        if p not in set(backbone_params) and p.required_grad]
+                        if p not in set(backbone_params) and p.requires_grad]
 
-        pb2_params_groups = [
+        pb2_param_groups = [
             {"params": backbone_params, "lr": unfreeze_lr, "weight_decay": cfg["weight_decay"]},
             {"params": head_params, "lr": cfg["learning_rate"], "weight_decay": cfg["weight_decay"]},
         ]
@@ -6112,7 +6111,7 @@ def run_tier3_finetune(
         )
 
         # Build optimizer with two tier param groups
-        pb2_optimizer = torch.optim.AdamW(pb2_params_groups)
+        pb2_optimizer = torch.optim.AdamW(pb2_param_groups)
         _saved_optimizer  = trainer.optimizer
         trainer.optimizer = pb2_optimizer
 
@@ -6133,7 +6132,7 @@ def run_tier3_finetune(
         trainer.optimizer = _saved_optimizer
         trainer.cfg = _saved_cfg
         log.info(
-            "Phase B2 complete: best val MAE=%.4f  at epoch=%d",
+            "Phase B2 complete: Best val_MAE=%.4f  at epoch %d"
             "(Phase B2 epoch %d)",
             trainer.best_val_mae, trainer.best_epoch,
             trainer.best_epoch - _pb_best_epoch,
