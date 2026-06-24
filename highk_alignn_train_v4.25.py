@@ -6662,9 +6662,9 @@ def run_tier_evaluate(
            rmse_k_exact = ((torch.exp(preds_t[valid]) -
                             torch.exp(trues_t[valid]))  ** 2).mean().sqrt().item()
         else:
-            mae_k_exact = rsme_k_exact = float("nan")
+            mae_k_exact = rmse_k_exact = float("nan")
         log.info(" Diagnostic log-space MAE = %.4f [log(k) units]", test_mae_log)
-        log.info(" Diagnostic log-space RSME = %.4f ",test_rmse_log )
+        log.info(" Diagnostic log-space RMSE = %.4f ",test_rmse_log )
         log.info(" exp (MAE) = %.4fx -> %.1f%% avg relative error",
                  math.exp(test_mae_log) if not math.isnan(test_mae_log) else float("nan"),
                  ((math.exp(test_mae_log) -1) *100) if not math.isnan(test_mae_log) else float("nan"))
