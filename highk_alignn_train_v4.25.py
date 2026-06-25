@@ -5142,7 +5142,7 @@ def run_tier1_pretrain(df_tier1: pd.DataFrame, ablate_context: bool = False):
     task_names = [cfg["target"]] + cfg["aux_targets"]
     log.info("Tier 1 training with targets: %s", task_names)
 
-    train_loader, val_loader, test_loader, train_sampler, _ds = build_dataloader(
+    train_loader, val_loader, test_loader, train_sampler, _main_ds_t1 = build_dataloader(
         df          = df_tier1,
         target_col  = cfg["target"],
         aux_cols    = cfg["aux_targets"],
@@ -5172,7 +5172,7 @@ def run_tier1_pretrain(df_tier1: pd.DataFrame, ablate_context: bool = False):
     log.info("Tier 1 TEST  MAE=%.4f  RMSE=%.4f  (target: %s)",
              test_mae, test_rmse, cfg["target"])
 
-    mt_results = trainer.evaluate_multitask(test_loader, cfg, df_full=df_tier1)
+    mt_results = trainer.evaluate_multitask(test_loader, cfg, df_full=_main_ds_t1.df)  # FIX-2: use dataset.df (reset_index applied) not raw df_tier1
     trainer.print_multitask_results(mt_results, split_name="TEST", tier_name="TIER 1")
 
     out_path = REPORT_ROOT / "tier1_test_results.json"
@@ -5231,7 +5231,7 @@ def run_tier2_finetune(
         )
     target_col = cfg["target"]   # "k_total_log" if log_transform else "k_total"
 
-    train_loader, val_loader, test_loader, train_sampler, _ds = build_dataloader(
+    train_loader, val_loader, test_loader, train_sampler, _main_ds_t2 = build_dataloader(
         df         = df_t2_k,
         target_col = target_col,
         aux_cols   = cfg["aux_targets"],
@@ -5345,7 +5345,7 @@ def run_tier2_finetune(
         log.info("Tier 2 TEST  MAE=%.4f  RMSE=%.4f  (target: k_total)",
                  test_mae_log, test_rmse_log)
 
-    mt_results = trainer.evaluate_multitask(test_loader, cfg, df_full=df_t2_k)
+    mt_results = trainer.evaluate_multitask(test_loader, cfg, df_full=_main_ds_t2.df)  # FIX-2: use dataset.df (reset_index applied) not raw df_t2_k
     trainer.print_multitask_results(mt_results, split_name="TEST", tier_name="TIER 2")
 
     out_path = REPORT_ROOT / "tier2_test_results.json"
@@ -5901,7 +5901,7 @@ def run_tier3_finetune(
         100.0 * _n_phase_b / max(len(df_structural), 1),
     )
 
-    train_loader, val_loader, test_loader, train_sampler, _ds = build_dataloader(
+    train_loader, val_loader, test_loader, train_sampler, _main_ds_t3 = build_dataloader(
         df         = df_phase_b,
         target_col = cfg["target"],
         aux_cols   = cfg["aux_targets"],
@@ -6027,7 +6027,7 @@ def run_tier3_finetune(
             "rows=%d  epochs=%d  lr≈%.2e  batch_size=%d",
             _n_phase_b, cfg["epochs"], cfg["learning_rate"], cfg["batch_size"]
         )
-        log.info(" Frozen : ALLIGN backbone (all message passing layers)")
+        log.info(" Frozen : ALIGNN backbone (all message passing layers)")  # FIX-3: typo ALLIGN→ALIGNN
         log.info(" Training task_heads, context_proj, proc_encoder, stack_encoder, alpha, beta")
 
         # Build Phase B dataloader with single task targets (k_total_log only)
@@ -6068,8 +6068,7 @@ def run_tier3_finetune(
         # Phase B2: unfreeze backbone, single-task (no aux heads)
         # Abandon multi-task for Tier3. Phase B2 is single-task
         # (k_total_log only) to avoid aux head gradient competition on 193 rows
-        unfreeze_after = cfg.get("unfreeze_backbone_after", 50)
-        unfreeze_lr = cfg.get("unfreeze_backbone_lr", 1e-5)
+        unfreeze_lr = cfg.get("unfreeze_backbone_lr", 1e-5)  # FIX-1: removed dead unfreeze_after variable (was read but never used)
         b2_epochs = max(0, cfg["epochs"] - _pb_best_epoch)
         if b2_epochs <= 0:
             b2_epochs = 30 # mininium if Phase B already converged
@@ -6295,8 +6294,19 @@ def run_tier3_finetune(
         "benchmark_scale":    "linear",
         "diagnostic_scale":   "log",
     }
+    # FIX-4: restore multitask section in tier3_test_results.json.
+    # evaluate_multitask is called here (training path) with _main_ds_t3.df
+    # so row_indices are aligned with the reset-indexed dataset (iloc==loc).
+    # Note: band_gap head was trained only during Phase A (500 steps on
+    # df_structural), not Phase B/B2. Its N_Valid and MAE are informational
+    # only — k_total_log remains the sole primary benchmark metric.
+    mt_results_t3 = trainer.evaluate_multitask(
+        test_loader, cfg, df_full=_main_ds_t3.df
+    )
+    trainer.print_multitask_results(mt_results_t3, split_name="TEST", tier_name="TIER 3")
+
     with open(out_path, "w") as f:
-        json.dump({"primary": primary_metrics}, f, indent=2)
+        json.dump({"primary": primary_metrics, "multitask": mt_results_t3}, f, indent=2)
     log.info("Tier 3 test results saved → %s", out_path)
 
     return CKPT_ROOT / "tier3_best.pt"
