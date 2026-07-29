@@ -1,0 +1,3 @@
+benchmark_row_id,source_database,source_material_id,structure_path,formula,formation_energy_per_atom,band_gap,k_total,dft_functional,functional_code
+ext-000001,OQMD,oqmd-example-1,structures/oqmd-example-1.cif,Al2O3,-3.2500,5.80,,PBE,1
+ext-000002,OQMD,oqmd-example-2,structures/oqmd-example-2.cif,HfO2,-3.1000,4.20,22.5,PBE,1
