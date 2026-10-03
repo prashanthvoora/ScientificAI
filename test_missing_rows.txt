@@ -1,0 +1,20 @@
+import pandas as pd
+
+path = "highk_project/data/tier3_project.h5"
+df = pd.read_hdf(path, key="data")
+
+print("Total cached rows:", len(df))
+
+for column in ["k_total", "k_measured"]:
+    if column not in df.columns:
+        continue
+
+    valid = pd.to_numeric(df[column], errors="coerce").notna()
+    print(f"\nTarget availability: {column}")
+    print(
+        df.assign(target_valid=valid)
+        .groupby(["source", "target_valid"])
+        .size()
+        .rename("n")
+        .to_string()
+    )
